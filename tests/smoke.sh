@@ -5,9 +5,9 @@ set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
-export LOGBOOK_DIR=$T/logbook RBH_DIR=$T/rbh RW_CTX=$T/ctx
+export LOGBOOK_DIR=$T/logbook histbook_DIR=$T/histbook RW_CTX=$T/ctx
 export GIT_AUTHOR_NAME=Test GIT_AUTHOR_EMAIL=test@example.com GIT_COMMITTER_NAME=Test GIT_COMMITTER_EMAIL=test@example.com
-for t in proofpack scopesmith handoff envguard logbook clientcast pulse rbh datamorph; do export PATH="$ROOT/$t/bin:$PATH"; done
+for t in proofpack scopesmith handoff envguard logbook clientcast pulse histbook datamorph; do export PATH="$ROOT/$t/bin:$PATH"; done
 pass=0 fail=0
 ok()   { echo "  ok    $1"; pass=$((pass + 1)); }
 bad()  { echo "  FAIL  $1"; fail=$((fail + 1)); }
@@ -150,33 +150,33 @@ kill $SRV 2>/dev/null
 pulse unit > "$T/unit.txt"
 check "systemd unit printed" has "$T/unit.txt" "OnUnitActiveSec=60"
 
-echo "== rbh"
-mkdir -p "$RBH_DIR/sessions"
-rbh start nginx-setup --title "Set up nginx on the Pi" >/dev/null
-check "start creates active marker" test -f "$RBH_DIR/active"
+echo "== histbook"
+mkdir -p "$histbook_DIR/sessions"
+histbook start nginx-setup --title "Set up nginx on the Pi" >/dev/null
+check "start creates active marker" test -f "$histbook_DIR/active"
 s=$(date +%s)
 { printf '%s\t0\t0\t%s\tls -la\n' $s "$HOME"
   printf '%s\t0\t42\t%s\tsudo apt install -y nginx\n' $s "$HOME"
   printf '%s\t100\t1\t%s\tsudo systemctl strat nginx\n' $s "$HOME"
-  printf '%s\t0\t0\t%s\trbh note "Configure the site"\n' $s "$HOME"
+  printf '%s\t0\t0\t%s\thistbook note "Configure the site"\n' $s "$HOME"
   printf '%s\t0\t1\t/etc/nginx\tsudo systemctl start nginx\n' $s
   printf '%s\t0\t1\t/etc/nginx\tsudo systemctl start nginx\n' $s
   printf '%s\t0\t0\t/etc/nginx\tcurl -u admin --password hunter22 http://localhost\n' $s
   printf '%s\t0\t0\t/etc/nginx\tcat > /tmp/site.conf <<EOF\\nserver { listen 80; }\\nEOF\n' $s
-} > "$RBH_DIR/sessions/nginx-setup.tsv"
-rbh stop > /dev/null
-R=$RBH_DIR/runbooks/nginx-setup.md
+} > "$histbook_DIR/sessions/nginx-setup.tsv"
+histbook stop > /dev/null
+R=$histbook_DIR/runbooks/nginx-setup.md
 check "runbook rendered" test -f "$R"
 check "failed typo dropped" bash -c "! grep -q 'strat' $R"
 check "noise (ls) dropped" bash -c "! grep -q 'ls -la' $R"
 check "duplicate dropped" test "$(grep -c 'systemctl start nginx' "$R")" -eq 1
 check "section heading from note" has "$R" "## Configure the site"
 check "password masked" bash -c "grep -q 'password <REDACTED>' $R && ! grep -q hunter22 $R"
-check "heredoc kept multi-line" has "$RBH_DIR/runbooks/nginx-setup.sh" "server { listen 80; }"
-check "script has strict mode" has "$RBH_DIR/runbooks/nginx-setup.sh" "set -euo pipefail"
-check "script is valid bash" bash -n "$RBH_DIR/runbooks/nginx-setup.sh"
-rbh hook > "$T/rbh.zsh"
-check "hook prints precmd" has "$T/rbh.zsh" "add-zsh-hook precmd"
+check "heredoc kept multi-line" has "$histbook_DIR/runbooks/nginx-setup.sh" "server { listen 80; }"
+check "script has strict mode" has "$histbook_DIR/runbooks/nginx-setup.sh" "set -euo pipefail"
+check "script is valid bash" bash -n "$histbook_DIR/runbooks/nginx-setup.sh"
+histbook hook > "$T/histbook.zsh"
+check "hook prints precmd" has "$T/histbook.zsh" "add-zsh-hook precmd"
 
 echo "== datamorph"
 D=$ROOT/examples/customers.csv
