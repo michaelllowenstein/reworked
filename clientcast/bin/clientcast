@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+"""clientcast - write (and optionally send) the weekly client update from commits, issues and hours.
+
+Usage:
+  clientcast [REPO ...] [--client NAME] [--since 7d] [--project NAME] [--logbook] [--hours FILE|-]
+             [--next TEXT ...] [--blocker TEXT ...] [--out FILE] [--send slack|email] [--to ADDR] [--json]
+
+Sources (all optional, used when available):
+  commits            git log --no-merges since the date, grouped by conventional-commit type
+  closed issues/PRs  `gh` CLI, when the repo has a GitHub remote and gh is logged in
+  hours              --hours FILE (logbook JSON), --hours - (stdin), --logbook (runs `logbook report`),
+                     or $RW_CTX/time.report.json from the rw hub
+Sending:
+  slack  needs SLACK_WEBHOOK_URL
+  email  needs SMTP_HOST, SMTP_PORT (587), SMTP_USER, SMTP_PASS, SMTP_FROM and --to
+Without --send the update is only printed / written, never sent.
+Hub capability: client.update (time.report JSON on stdin)
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import shutil
+import smtplib
+import subprocess
+import sys
+import urllib.request
+from email.message import EmailMessage
+from pathlib import Path
+
+VERSION = "0.1.0"
+CAPABILITIES = {"client.update": ["--hours", "-", "--json"]}
+GROUPS = [("Shipped", {"feat", "feature", "add"}), ("Fixed", {"fix", "bugfix", "hotfix"}),
+          ("Improved", {"perf", "refactor", "improve", "style"}), ("Docs and tests", {"docs", "doc", "test", "tests"}),
+          ("Maintenance", {"chore", "build", "ci", "deps", "release"})]
+
+
+def log(msg):
+    print(f"clientcast: {msg}", file=sys.stderr)
+
+
+def since_date(s: str):
+    m = re.fullmatch(r"(\d+)([dw])", s)
+    if m:
+        days = int(m.group(1)) * (7 if m.group(2) == "w" else 1)
+        return dt.date.today() - dt.timedelta(days=days)
+    return dt.date.fromisoformat(s)
+
+
+def git(repo, *args):
+    try:
+        p = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=60)
+        return p.stdout if p.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def commits(repo: Path, since: dt.date):
+    out = git(repo, "log", "--no-merges", f"--since={since.isoformat()}", "--pretty=format:%h%x09%ad%x09%s", "--date=short") or ""
+    grouped = {g: [] for g, _ in GROUPS}
+    grouped["Other changes"] = []
+    count = 0
+    for line in out.splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) < 3:
+            continue
+        sha, date, subj = parts
+        if re.match(r"^(wip|fixup!|squash!|merge)\b", subj, re.I):
+            continue
+        count += 1
+        m = re.match(r"^(\w+)(?:\(([^)]+)\))?!?:\s*(.+)$", subj)
+        if m:
+            kind, scope, text = m.group(1).lower(), m.group(2), m.group(3)
+        else:
+            kind, scope, text = "", None, subj
+        text = text[0].upper() + text[1:] if text else text
+        if scope:
+            text = f"{text} ({scope})"
+        target = next((g for g, kinds in GROUPS if kind in kinds), "Other changes")
+        grouped[target].append({"sha": sha, "date": date, "text": text})
+    return count, {k: v for k, v in grouped.items() if v}
+
+
+def github(repo: Path, since: dt.date):
+    if not shutil.which("gh"):
+        return None
+    remote = git(repo, "remote", "get-url", "origin") or ""
+    if "github.com" not in remote:
+        return None
+    res = {}
+    for kind, args in (("issues_closed", ["issue", "list", "--state", "closed", "--search", f"closed:>={since}"]),
+                       ("prs_merged", ["pr", "list", "--state", "merged", "--search", f"merged:>={since}"])):
+        try:
+            p = subprocess.run(["gh", *args, "--json", "number,title,url", "--limit", "50"], cwd=repo,
+                               capture_output=True, text=True, timeout=60)
+            if p.returncode != 0:
+                return None
+            res[kind] = json.loads(p.stdout or "[]")
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return None
+    return res
+
+
+def load_hours(a, since: dt.date):
+    data = None
+    if a.hours == "-":
+        raw = sys.stdin.read()
+        data = json.loads(raw) if raw.strip() else None
+    elif a.hours:
+        data = json.loads(Path(a.hours).expanduser().read_text())
+    elif a.logbook and shutil.which("logbook"):
+        args = ["logbook", "report", "--json", "--since", since.isoformat()]
+        if a.project:
+            args += ["--project", a.project]
+        p = subprocess.run(args, capture_output=True, text=True)
+        data = json.loads(p.stdout) if p.returncode == 0 and p.stdout.strip() else None
+    elif os.environ.get("RW_CTX") and (Path(os.environ["RW_CTX"]) / "time.report.json").is_file():
+        data = json.loads((Path(os.environ["RW_CTX"]) / "time.report.json").read_text())
+    if not data:
+        return None
+    projects = data.get("projects", [])
+    if a.project:
+        projects = [p for p in projects if p["project"] == a.project]
+    return {"hours": round(sum(p["hours"] for p in projects), 2),
+            "by_project": {p["project"]: p["hours"] for p in projects}}
+
+
+def compose(a, repos):
+    since = since_date(a.since)
+    week_of = since
+    sections, total, gh = {}, 0, {"issues_closed": [], "prs_merged": []}
+    for repo in repos:
+        n, groups = commits(repo, since)
+        total += n
+        for g, items in groups.items():
+            prefix = f"[{repo.name}] " if len(repos) > 1 else ""
+            sections.setdefault(g, []).extend({**i, "text": prefix + i["text"]} for i in items)
+        g = github(repo, since)
+        if g:
+            for k in gh:
+                gh[k] += g.get(k, [])
+    hours = load_hours(a, since)
+    client = a.client or (repos[0].name if repos else "Client")
+    subject = f"Weekly update: {client}, week of {week_of.strftime('%b %d, %Y').replace(' 0', ' ')}"
+    shipped = len(sections.get("Shipped", [])) + len(gh["prs_merged"])
+    fixed = len(sections.get("Fixed", []))
+    bits = [f"{shipped} item(s) shipped", f"{fixed} fix(es)"]
+    if gh["issues_closed"]:
+        bits.append(f"{len(gh['issues_closed'])} issue(s) closed")
+    if hours:
+        bits.append(f"{hours['hours']:g} hours logged")
+    L = [f"Hi {a.greeting or client.split()[0]},", "", f"Here is this week's progress: {', '.join(bits)}.", ""]
+    order = [g for g, _ in GROUPS] + ["Other changes"]
+    for g in order:
+        items = sections.get(g)
+        if items:
+            L += [f"**{g}**"] + [f"- {i['text']}" for i in items[:12]]
+            if len(items) > 12:
+                L.append(f"- ...and {len(items) - 12} more")
+            L.append("")
+    if gh["prs_merged"]:
+        L += ["**Merged pull requests**"] + [f"- #{p['number']} {p['title']}" for p in gh["prs_merged"]] + [""]
+    if gh["issues_closed"]:
+        L += ["**Closed issues**"] + [f"- #{i['number']} {i['title']}" for i in gh["issues_closed"]] + [""]
+    if hours:
+        L += ["**Time**"] + [f"- {p}: {h:g} h" for p, h in hours["by_project"].items()] + [""]
+    if a.next:
+        L += ["**Next up**"] + [f"- {n}" for n in a.next] + [""]
+    L += ["**Blockers / needs from you**"] + ([f"- {b}" for b in a.blocker] if a.blocker else ["- None this week"]) + [""]
+    L += ["Reply with any questions or priorities for next week.", "", a.signoff or ""]
+    md = "\n".join(L).rstrip() + "\n"
+    if total == 0 and not gh["prs_merged"] and not hours:
+        log("no commits, merged PRs or hours found for this period")
+    return {"tool": "clientcast", "version": VERSION, "client": client, "since": since.isoformat(),
+            "subject": subject, "commits": total, "sections": sections, "github": gh, "hours": hours, "markdown": md}
+
+
+def to_slack(md: str):
+    text = re.sub(r"\*\*(.+?)\*\*", r"*\1*", md)
+    return re.sub(r"^- ", "• ", text, flags=re.M)
+
+
+def send(update, how, to):
+    if how == "slack":
+        url = os.environ.get("SLACK_WEBHOOK_URL")
+        if not url:
+            raise SystemExit("clientcast: set SLACK_WEBHOOK_URL to send to Slack")
+        body = json.dumps({"text": f"*{update['subject']}*\n\n{to_slack(update['markdown'])}"}).encode()
+        req = urllib.request.Request(url, data=body, headers={"content-type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return f"slack: HTTP {r.status}"
+    if how == "email":
+        need = ["SMTP_HOST", "SMTP_USER", "SMTP_PASS", "SMTP_FROM"]
+        missing = [k for k in need if not os.environ.get(k)]
+        if missing or not to:
+            raise SystemExit(f"clientcast: email needs --to and env {', '.join(missing) or 'OK'}")
+        msg = EmailMessage()
+        msg["Subject"], msg["From"], msg["To"] = update["subject"], os.environ["SMTP_FROM"], to
+        msg.set_content(update["markdown"].replace("**", ""))
+        port = int(os.environ.get("SMTP_PORT", 587))
+        if port == 465:
+            server = smtplib.SMTP_SSL(os.environ["SMTP_HOST"], port, timeout=30)
+        else:
+            server = smtplib.SMTP(os.environ["SMTP_HOST"], port, timeout=30)
+            server.starttls()
+        with server:
+            server.login(os.environ["SMTP_USER"], os.environ["SMTP_PASS"])
+            server.send_message(msg)
+        return f"email: sent to {to}"
+    raise SystemExit(f"clientcast: unknown --send target {how}")
+
+
+def main(argv):
+    cap_mode = bool(argv) and argv[0] in CAPABILITIES
+    if cap_mode:
+        argv = CAPABILITIES[argv[0]] + argv[1:]
+        if sys.stdin.isatty():
+            argv = [x for x in argv if x not in ("--hours", "-")]
+    ap = argparse.ArgumentParser(prog="clientcast", description=__doc__.split("\n")[0])
+    ap.add_argument("repos", nargs="*", default=["."])
+    ap.add_argument("--client")
+    ap.add_argument("--greeting", help="name in the greeting line (default: first word of --client)")
+    ap.add_argument("--signoff", default=os.environ.get("CLIENTCAST_SIGNOFF", ""))
+    ap.add_argument("--since", default="7d", help="7d, 2w or YYYY-MM-DD")
+    ap.add_argument("--project", help="logbook project name to report hours for")
+    ap.add_argument("--hours", help="logbook JSON file, or - for stdin")
+    ap.add_argument("--logbook", action="store_true", help="run `logbook report` for hours")
+    ap.add_argument("--next", action="append", default=[])
+    ap.add_argument("--blocker", action="append", default=[])
+    ap.add_argument("--out", help="write the markdown here")
+    ap.add_argument("--send", choices=["slack", "email"])
+    ap.add_argument("--to")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--version", action="version", version=VERSION)
+    a = ap.parse_args(argv)
+    repos = [Path(r).expanduser().resolve() for r in a.repos]
+    repos = [r for r in repos if git(r, "rev-parse", "--git-dir") is not None]
+    if not repos:
+        log("no git repositories given; the update will only include hours and notes")
+    upd = compose(a, repos)
+    if a.out:
+        Path(a.out).write_text(f"# {upd['subject']}\n\n{upd['markdown']}")
+        log(f"wrote {a.out}")
+    if a.send:
+        upd["sent"] = send(upd, a.send, a.to)
+        log(upd["sent"])
+    if a.json or not sys.stdout.isatty():
+        print(json.dumps(upd, indent=2))
+    else:
+        print(f"Subject: {upd['subject']}\n")
+        print(upd["markdown"])
+        if not a.send:
+            print("(not sent; add --send slack or --send email --to ADDR)", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

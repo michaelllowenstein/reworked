@@ -1,0 +1,309 @@
+#!/usr/bin/env python3
+"""histbook (runbook-from-history) - record what you actually ran, then render a clean runbook and script.
+
+Usage:
+  histbook hook                       print the zsh hook (add to ~/.zshrc: eval "$(histbook hook)")
+  histbook start NAME [--title TEXT]  start recording commands in this and any other shell
+  histbook note TEXT                  start a new section in the runbook (e.g. "Configure nginx")
+  histbook status                     show what is being recorded
+  histbook stop                       stop recording and render NAME
+  histbook render NAME [--keep-failed] [--keep-noise] [--out DIR] [--json]
+  histbook list                       list recorded sessions
+
+Rendering drops failed commands, navigation and inspection noise (ls, cat, clear...), consecutive
+duplicates and histbook's own commands; masks secrets; records directory changes as context; and writes
+NAME.md (runbook) plus NAME.sh (re-runnable script with set -euo pipefail).
+Data dir: $histbook_DIR (default ~/.local/share/histbook). Hub capability: docs.runbook
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import platform
+import re
+import shlex
+import sys
+from pathlib import Path
+
+VERSION = "0.1.0"
+CAPABILITIES = {"docs.runbook": ["render", "--last", "--json"]}
+DATA = Path(os.environ.get("histbook_DIR", Path.home() / ".local/share/histbook")).expanduser()
+ACTIVE = DATA / "active"
+SESSIONS = DATA / "sessions"
+OUT = DATA / "runbooks"
+
+NOISE = {"ls", "ll", "la", "l", "clear", "pwd", "history", "exit", "man", "less", "more", "which", "type",
+         "whoami", "tree", "cat", "bat", "head", "tail", "echo", "printf", "fc", "help", "z", "j", "htop", "top",
+         "jobs", "fg", "bg", "true", "date", "env", "printenv", "exa", "eza", "lsd", "du", "df", "file", "stat",
+         "git status", "git diff", "git log", "git show", "git branch", "rw ls", "rw doctor"}
+SECRET_FLAG = re.compile(r"(--?(?:password|passwd|pass|token|secret|api-key|apikey|key|auth)[= ])(\S+)", re.I)
+SECRET_ENV = re.compile(r"\b([A-Z0-9_]*(?:PASSWORD|PASSWD|SECRET|TOKEN|API_KEY|APIKEY|ACCESS_KEY|PRIVATE_KEY)[A-Z0-9_]*)=(\S+)")
+URL_CRED = re.compile(r"(://[^/\s:@]+:)([^@\s]+)(@)")
+INSTALL = re.compile(r"^(sudo\s+)?(apt(-get)?|dnf|yum|pacman|brew|apk|zypper|pip3?|pipx|npm|pnpm|yarn|cargo|go)\s+(install|add|-S|i)\b")
+
+HOOK = r'''# histbook: record commands while `histbook start NAME` is active
+zmodload zsh/datetime 2>/dev/null
+typeset -g histbook_DIR="${histbook_DIR:-$HOME/.local/share/histbook}"
+typeset -g _histbook_cmd='' _histbook_t0=0
+_histbook_preexec() { [[ -f $histbook_DIR/active ]] && { _histbook_cmd=$1; _histbook_t0=$EPOCHREALTIME } }
+_histbook_precmd() {
+  local rc=$?
+  [[ -n $_histbook_cmd && -f $histbook_DIR/active ]] || { _histbook_cmd=''; return }
+  local name=$(<$histbook_DIR/active) dur=$(( EPOCHREALTIME - _histbook_t0 ))
+  local enc=${_histbook_cmd//\\/\\\\}; enc=${enc//$'\n'/\\n}; enc=${enc//$'\t'/\\t}
+  print -r -- "${EPOCHSECONDS}"$'\t'"${rc}"$'\t'"${dur%.*}"$'\t'"${PWD}"$'\t'"${enc}" >>| "$histbook_DIR/sessions/$name.tsv"
+  _histbook_cmd=''
+}
+autoload -Uz add-zsh-hook
+add-zsh-hook preexec _histbook_preexec
+add-zsh-hook precmd _histbook_precmd
+'''
+
+
+def log(msg):
+    print(f"histbook: {msg}", file=sys.stderr)
+
+
+def decode(s):
+    out, i = [], 0
+    while i < len(s):
+        if s[i] == "\\" and i + 1 < len(s):
+            out.append({"n": "\n", "t": "\t", "\\": "\\"}.get(s[i + 1], s[i + 1]))
+            i += 2
+        else:
+            out.append(s[i])
+            i += 1
+    return "".join(out)
+
+
+def load(name):
+    p = SESSIONS / f"{name}.tsv"
+    if not p.is_file():
+        raise SystemExit(f"histbook: no session '{name}' (histbook list)")
+    rows = []
+    for line in p.read_text(errors="replace").splitlines():
+        parts = line.split("\t", 4)
+        if len(parts) < 5:
+            continue
+        ts, rc, dur, pwd, cmd = parts
+        rows.append({"ts": int(ts), "rc": rc, "dur": int(dur or 0) if dur.lstrip("-").isdigit() else 0,
+                     "pwd": pwd, "cmd": decode(cmd)})
+    return rows
+
+
+def meta_path(name):
+    return SESSIONS / f"{name}.meta.json"
+
+
+def mask(cmd):
+    secrets = []
+
+    def flag(m):
+        secrets.append(m.group(1).strip("-= "))
+        return m.group(1) + "<REDACTED>"
+
+    def env(m):
+        secrets.append(m.group(1))
+        return f"{m.group(1)}=<REDACTED>"
+
+    cmd = SECRET_FLAG.sub(flag, cmd)
+    cmd = SECRET_ENV.sub(env, cmd)
+    if URL_CRED.search(cmd):
+        secrets.append("URL password")
+        cmd = URL_CRED.sub(r"\1<REDACTED>\3", cmd)
+    return cmd, secrets
+
+
+def is_noise(cmd):
+    c = cmd.strip()
+    first = c.split()[0] if c.split() else ""
+    two = " ".join(c.split()[:2])
+    if first in ("histbook", "logbook") or c.startswith(("histbook ", "eval \"$(histbook", "eval \"$(logbook")):
+        return True
+    if first in NOISE and not re.search(r"[>|]", c):  # keep `cat > file <<EOF`, `echo x >> f`, pipes
+        return True
+    return two in NOISE and not re.search(r"[>|]", c)
+
+
+def cd_line(d):
+    if d == "~":
+        return "cd ~"
+    if d.startswith("~/"):
+        return "cd ~/" + shlex.quote(d[2:])
+    return "cd " + shlex.quote(d)
+
+
+def render(name, keep_failed=False, keep_noise=False):
+    rows = load(name)
+    meta = json.loads(meta_path(name).read_text()) if meta_path(name).is_file() else {}
+    home = str(Path.home())
+    sections = [{"title": None, "steps": []}]
+    last_cmd, last_dir, dropped, secrets = None, meta.get("start_dir"), {"failed": 0, "noise": 0, "dup": 0}, set()
+    for r in rows:
+        cmd = r["cmd"].strip()
+        if not cmd:
+            continue
+        if cmd.startswith("histbook note "):
+            text = cmd[len("histbook note "):].strip().strip("'\"")
+            sections.append({"title": text, "steps": []})
+            continue
+        if r["rc"] != "0" and not keep_failed:
+            dropped["failed"] += 1
+            continue
+        first = cmd.split()[0]
+        if first in ("cd", "pushd", "popd") or (first == "z" and len(cmd.split()) > 1):
+            continue  # directory changes are captured from pwd below
+        if not keep_noise and is_noise(cmd):
+            dropped["noise"] += 1
+            continue
+        if cmd == last_cmd:
+            dropped["dup"] += 1
+            continue
+        last_cmd = cmd
+        shown, found = mask(cmd)
+        secrets.update(found)
+        step = {"cmd": shown.replace(home, "~"), "dir": None, "dur": r["dur"], "rc": r["rc"],
+                "install": bool(INSTALL.match(cmd)), "sudo": cmd.startswith("sudo ")}
+        if r["pwd"] != last_dir:
+            step["dir"] = r["pwd"].replace(home, "~")
+            last_dir = r["pwd"]
+        sections[-1]["steps"].append(step)
+    sections = [s for s in sections if s["steps"] or s["title"]]
+    started = dt.datetime.fromtimestamp(rows[0]["ts"]) if rows else dt.datetime.now()
+    title = meta.get("title") or name.replace("-", " ").replace("_", " ").capitalize()
+    total = sum(len(s["steps"]) for s in sections)
+
+    md = [f"# {title}", "",
+          f"Recorded {started:%Y-%m-%d} on {platform.system()} {platform.release()} ({platform.machine()}), "
+          f"{total} steps. Generated by histbook {VERSION} from the commands that actually ran.", ""]
+    needs = sorted({s["cmd"].split()[1] if s["sudo"] else s["cmd"].split()[0] for sec in sections for s in sec["steps"] if s["install"]})
+    if any(s["sudo"] for sec in sections for s in sec["steps"]):
+        md += ["> Some steps use `sudo`; run as a user with admin rights.", ""]
+    if secrets:
+        md += ["> Secrets were removed. Before running, supply: " + ", ".join(f"`{s}`" for s in sorted(secrets)) + ".", ""]
+    sh = ["#!/usr/bin/env bash", f"# {title} - generated by histbook {VERSION} on {dt.date.today()}", "set -euo pipefail", ""]
+    n = 0
+    for sec in sections:
+        if sec["title"]:
+            md += [f"## {sec['title']}", ""]
+            sh += [f"# --- {sec['title']} ---"]
+        elif len(sections) > 1:
+            md += ["## Steps", ""]
+        for s in sec["steps"]:
+            n += 1
+            note = []
+            if s["dir"]:
+                note.append(f"in `{s['dir']}`")
+                sh.append(cd_line(s["dir"]))
+            if s["dur"] >= 10:
+                note.append(f"took about {s['dur'] // 60} min {s['dur'] % 60} s" if s["dur"] >= 60 else f"took about {s['dur']} s")
+            if s["rc"] != "0":
+                note.append(f"**failed with exit {s['rc']}** when recorded")
+            md.append(f"{n}. " + ("Run " + ", ".join(note) + ":" if note else "Run:"))
+            md += ["", "    ```sh"] + [f"    {line}" for line in s["cmd"].splitlines()] + ["    ```", ""]
+            sh.append(s["cmd"] if s["rc"] == "0" else f"# FAILED when recorded: {s['cmd']}")
+        sh.append("")
+    md += ["## Notes", "",
+           f"- Dropped from the recording: {dropped['failed']} failed, {dropped['noise']} inspection/navigation, {dropped['dup']} duplicate command(s).",
+           "- Review each step before running it on another machine.", ""]
+    if needs:
+        md.insert(4, "Package managers used: " + ", ".join(f"`{x}`" for x in needs) + ".")
+        md.insert(5, "")
+    return {"name": name, "title": title, "steps": total, "secrets_masked": sorted(secrets), "dropped": dropped,
+            "markdown": "\n".join(md), "script": "\n".join(sh) + "\n"}
+
+
+def main(argv):
+    cap_mode = bool(argv) and argv[0] in CAPABILITIES
+    if cap_mode:
+        argv = CAPABILITIES[argv[0]] + argv[1:]
+    ap = argparse.ArgumentParser(prog="histbook", description=__doc__.split("\n")[0])
+    ap.add_argument("--version", action="version", version=VERSION)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("hook")
+    sp = sub.add_parser("start")
+    sp.add_argument("name")
+    sp.add_argument("--title")
+    sp = sub.add_parser("note")
+    sp.add_argument("text", nargs="+")
+    sub.add_parser("status")
+    sp = sub.add_parser("stop")
+    sp.add_argument("--out")
+    sp = sub.add_parser("render")
+    sp.add_argument("name", nargs="?")
+    sp.add_argument("--last", action="store_true", help="render the most recent session")
+    sp.add_argument("--keep-failed", action="store_true")
+    sp.add_argument("--keep-noise", action="store_true")
+    sp.add_argument("--out", help=f"output dir (default {OUT})")
+    sp.add_argument("--json", action="store_true")
+    sub.add_parser("list")
+    a = ap.parse_args(argv)
+    SESSIONS.mkdir(parents=True, exist_ok=True)
+
+    if a.cmd == "hook":
+        print(HOOK, end="")
+        return 0
+    if a.cmd == "start":
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", a.name):
+            raise SystemExit("histbook: NAME may contain letters, digits, . _ - only")
+        if ACTIVE.is_file():
+            raise SystemExit(f"histbook: already recording '{ACTIVE.read_text().strip()}' (histbook stop first)")
+        meta_path(a.name).write_text(json.dumps({"title": a.title, "start_dir": os.getcwd(), "started": int(dt.datetime.now().timestamp())}))
+        ACTIVE.write_text(a.name)
+        print(f"recording '{a.name}'. Work as normal; use `histbook note \"Section\"` for headings and `histbook stop` when done.")
+        return 0
+    if a.cmd == "note":
+        # The hook records this command itself (it is turned into a heading at render time).
+        if not ACTIVE.is_file():
+            raise SystemExit("histbook: not recording")
+        print(f"section: {' '.join(a.text)}")
+        return 0
+    if a.cmd == "status":
+        if ACTIVE.is_file():
+            name = ACTIVE.read_text().strip()
+            n = len(load(name)) if (SESSIONS / f"{name}.tsv").is_file() else 0
+            print(f"recording '{name}': {n} command(s) so far")
+        else:
+            print("not recording")
+        return 0
+    if a.cmd == "list":
+        for p in sorted(SESSIONS.glob("*.tsv"), key=lambda p: p.stat().st_mtime, reverse=True):
+            n = sum(1 for _ in p.open())
+            print(f"{p.stem:<30} {n:>4} commands  {dt.datetime.fromtimestamp(p.stat().st_mtime):%Y-%m-%d %H:%M}")
+        return 0
+    if a.cmd == "stop":
+        if not ACTIVE.is_file():
+            raise SystemExit("histbook: not recording")
+        name = ACTIVE.read_text().strip()
+        ACTIVE.unlink()
+        if not (SESSIONS / f"{name}.tsv").is_file():
+            print(f"histbook: nothing was recorded for '{name}'. Is the hook loaded? Add eval \"$(histbook hook)\" to ~/.zshrc", file=sys.stderr)
+            return 1
+        a.name, a.last, a.keep_failed, a.keep_noise, a.json = name, False, False, False, False
+    if a.last or not a.name:
+        tsvs = sorted(SESSIONS.glob("*.tsv"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not tsvs:
+            raise SystemExit("histbook: no sessions recorded yet")
+        a.name = tsvs[0].stem
+    res = render(a.name, a.keep_failed, a.keep_noise)
+    out = Path(a.out).expanduser() if a.out else OUT
+    out.mkdir(parents=True, exist_ok=True)
+    (out / f"{a.name}.md").write_text(res["markdown"])
+    script = out / f"{a.name}.sh"
+    script.write_text(res["script"])
+    script.chmod(0o755)
+    res["files"] = {"runbook": str(out / f"{a.name}.md"), "script": str(script)}
+    if a.json or not sys.stdout.isatty():
+        print(json.dumps(res, indent=2))
+    else:
+        print(f"{res['steps']} steps -> {res['files']['runbook']}")
+        print(f"script   -> {res['files']['script']}")
+        if res["secrets_masked"]:
+            print(f"masked secrets: {', '.join(res['secrets_masked'])}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

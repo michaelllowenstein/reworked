@@ -1,0 +1,8 @@
+# rw hub manifest for datamorph (written by install.sh)
+RW_NAME=datamorph
+RW_DESC="Clean, validate and reshape CSV and JSON with recipes"
+RW_ROOT=@ROOT@
+RW_ENTRY=($RW_ROOT/bin/datamorph)
+RW_PROVIDES=(data.transform)
+RW_CONSUMES=(data.json)
+RW_ENV=()

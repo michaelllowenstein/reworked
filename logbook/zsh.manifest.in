@@ -1,0 +1,8 @@
+# rw hub manifest for logbook (written by install.sh)
+RW_NAME=logbook
+RW_DESC="Shell and git time tracking to invoice CSV"
+RW_ROOT=@ROOT@
+RW_ENTRY=($RW_ROOT/bin/logbook)
+RW_PROVIDES=(time.report)
+RW_CONSUMES=(tool.active)
+RW_ENV=()

@@ -1,0 +1,370 @@
+#!/usr/bin/env python3
+"""pulse - self-hosted health checks, alerts and a static status page.
+
+Usage:
+  pulse init  [--config FILE]                 write a starter pulse.json
+  pulse check [--config FILE] [--json]        run every check once, record history, alert on changes
+  pulse page  [--config FILE] [--out DIR]     render status page (index.html + status.json)
+  pulse watch [--config FILE] [--interval 60] check + page in a loop
+  pulse serve [--config FILE] [--port 8080]   serve the status page directory
+  pulse unit  [--config FILE]                 print systemd service + timer for a Raspberry Pi / VPS
+
+Check types: http (status, keyword, max_ms), tcp (host, port), disk (path, max_percent),
+             cert (host, min_days until TLS expiry), command (any shell command, exit 0 = up)
+Alerts: Slack webhook from the env var named in config.alert.slack_webhook_env, on up/down changes.
+State dir: next to the config, in .pulse/  Hub capability: ops.status
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import html
+import http.server
+import json
+import os
+import shutil
+import socket
+import ssl
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from functools import partial
+from pathlib import Path
+
+VERSION = "0.1.0"
+CAPABILITIES = {"ops.status": ["check", "--json"]}
+DEFAULT_CONFIG = os.environ.get("PULSE_CONFIG", "pulse.json")
+
+SAMPLE = {
+    "title": "Service status",
+    "history_days": 30,
+    "page_dir": ".pulse/site",
+    "alert": {"slack_webhook_env": "SLACK_WEBHOOK_URL"},
+    "checks": [
+        {"name": "Example website", "type": "http", "url": "https://example.com", "expect_status": 200,
+         "contains": "Example Domain", "max_ms": 3000, "timeout": 10},
+        {"name": "SSH on this machine", "type": "tcp", "host": "127.0.0.1", "port": 22, "timeout": 3},
+        {"name": "Root disk", "type": "disk", "path": "/", "max_percent": 90},
+        {"name": "example.com certificate", "type": "cert", "host": "example.com", "min_days": 14},
+    ],
+}
+
+
+def log(msg):
+    print(f"pulse: {msg}", file=sys.stderr)
+
+
+def load_config(path: Path):
+    if not path.is_file():
+        raise SystemExit(f"pulse: no config at {path} (create one with: pulse init)")
+    cfg = json.loads(path.read_text())
+    cfg.setdefault("title", "Service status")
+    cfg.setdefault("history_days", 30)
+    state = path.parent / ".pulse"
+    state.mkdir(exist_ok=True)
+    page = Path(cfg.get("page_dir", ".pulse/site"))
+    cfg["_page_dir"] = page if page.is_absolute() else path.parent / page
+    cfg["_state"] = state
+    return cfg
+
+
+def check_http(c):
+    req = urllib.request.Request(c["url"], method=c.get("method", "GET"), headers={"User-Agent": f"pulse/{VERSION}"})
+    start = time.perf_counter()
+    try:
+        with urllib.request.urlopen(req, timeout=c.get("timeout", 10)) as r:
+            body = r.read(512_000).decode("utf-8", "replace")
+            status = r.status
+    except urllib.error.HTTPError as e:
+        status, body = e.code, ""
+    ms = round((time.perf_counter() - start) * 1000)
+    problems = []
+    if status != c.get("expect_status", 200):
+        problems.append(f"HTTP {status}")
+    if c.get("contains") and c["contains"] not in body:
+        problems.append(f"missing text '{c['contains']}'")
+    if c.get("max_ms") and ms > c["max_ms"]:
+        problems.append(f"slow: {ms} ms > {c['max_ms']} ms")
+    return (not problems), ms, "; ".join(problems) or f"HTTP {status}"
+
+
+def check_tcp(c):
+    start = time.perf_counter()
+    with socket.create_connection((c["host"], int(c["port"])), timeout=c.get("timeout", 5)):
+        pass
+    return True, round((time.perf_counter() - start) * 1000), f"port {c['port']} open"
+
+
+def check_disk(c):
+    u = shutil.disk_usage(c.get("path", "/"))
+    pct = round(100 * u.used / u.total, 1)
+    limit = c.get("max_percent", 90)
+    return pct <= limit, None, f"{pct}% used ({u.free // 2**30} GiB free)"
+
+
+def check_cert(c):
+    host, port = c["host"], int(c.get("port", 443))
+    ctx = ssl.create_default_context()
+    start = time.perf_counter()
+    with socket.create_connection((host, port), timeout=c.get("timeout", 10)) as s:
+        with ctx.wrap_socket(s, server_hostname=host) as tls:
+            cert = tls.getpeercert()
+    ms = round((time.perf_counter() - start) * 1000)
+    expires = dt.datetime.fromtimestamp(ssl.cert_time_to_seconds(cert["notAfter"]), dt.timezone.utc)
+    days = (expires - dt.datetime.now(dt.timezone.utc)).days
+    return days >= c.get("min_days", 14), ms, f"certificate expires in {days} days ({expires.date()})"
+
+
+def check_command(c):
+    start = time.perf_counter()
+    p = subprocess.run(c["command"], shell=True, capture_output=True, text=True, timeout=c.get("timeout", 30))
+    ms = round((time.perf_counter() - start) * 1000)
+    out = (p.stdout or p.stderr).strip().splitlines()
+    return p.returncode == 0, ms, (out[-1][:200] if out else f"exit {p.returncode}")
+
+
+CHECKS = {"http": check_http, "tcp": check_tcp, "disk": check_disk, "cert": check_cert, "command": check_command}
+
+
+def run_check(c):
+    fn = CHECKS.get(c.get("type", "http"))
+    if not fn:
+        return {"name": c["name"], "up": False, "ms": None, "detail": f"unknown type {c.get('type')}"}
+    try:
+        up, ms, detail = fn(c)
+    except Exception as e:  # noqa: BLE001 - any failure means the check is down
+        up, ms, detail = False, None, f"{type(e).__name__}: {e}"[:300]
+    return {"name": c["name"], "type": c.get("type", "http"), "up": up, "ms": ms, "detail": detail}
+
+
+def history_path(cfg):
+    return cfg["_state"] / "history.jsonl"
+
+
+def load_history(cfg, days=None):
+    p = history_path(cfg)
+    if not p.is_file():
+        return []
+    cutoff = time.time() - 86400 * (days or cfg["history_days"])
+    rows = []
+    for line in p.read_text().splitlines():
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if r.get("ts", 0) >= cutoff:
+            rows.append(r)
+    return rows
+
+
+def prune(cfg):
+    rows = load_history(cfg)
+    history_path(cfg).write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+
+def alert(cfg, changes):
+    env = cfg.get("alert", {}).get("slack_webhook_env")
+    url = os.environ.get(env) if env else None
+    if not url or not changes:
+        return
+    lines = [f"{'RECOVERED' if c['up'] else 'DOWN'}: {c['name']} ({c['detail']})" for c in changes]
+    body = json.dumps({"text": f"*{cfg['title']}*\n" + "\n".join(lines)}).encode()
+    try:
+        urllib.request.urlopen(urllib.request.Request(url, data=body, headers={"content-type": "application/json"}), timeout=15)
+    except OSError as e:
+        log(f"alert failed: {e}")
+
+
+def cmd_check(cfg):
+    ts = int(time.time())
+    results = [run_check(c) for c in cfg["checks"]]
+    state_file = cfg["_state"] / "last.json"
+    last = json.loads(state_file.read_text()) if state_file.is_file() else {}
+    changes = [r for r in results if r["name"] in last and last[r["name"]] != r["up"]]
+    alert(cfg, changes)
+    state_file.write_text(json.dumps({r["name"]: r["up"] for r in results}))
+    with history_path(cfg).open("a") as fh:
+        for r in results:
+            fh.write(json.dumps({"ts": ts, **r}) + "\n")
+    if ts % 3600 < 120:
+        prune(cfg)
+    return {"tool": "pulse", "checked_at": dt.datetime.fromtimestamp(ts, dt.timezone.utc).isoformat(),
+            "all_up": all(r["up"] for r in results), "results": results,
+            "changes": [{"name": c["name"], "up": c["up"]} for c in changes]}
+
+
+def uptime(rows, name, seconds):
+    cutoff = time.time() - seconds
+    sel = [r for r in rows if r["name"] == name and r["ts"] >= cutoff]
+    return round(100 * sum(r["up"] for r in sel) / len(sel), 2) if sel else None
+
+
+def cmd_page(cfg, out: Path | None):
+    out = out or cfg["_page_dir"]
+    out.mkdir(parents=True, exist_ok=True)
+    rows = load_history(cfg)
+    names = [c["name"] for c in cfg["checks"]]
+    cards, summary = [], []
+    days = min(30, cfg["history_days"])
+    today = dt.date.today()
+    for name in names:
+        mine = [r for r in rows if r["name"] == name]
+        latest = mine[-1] if mine else None
+        bars = []
+        for i in range(days - 1, -1, -1):
+            day = today - dt.timedelta(days=i)
+            sel = [r for r in mine if dt.date.fromtimestamp(r["ts"]) == day]
+            if not sel:
+                cls, tip = "none", f"{day}: no data"
+            else:
+                pct = 100 * sum(r["up"] for r in sel) / len(sel)
+                cls = "up" if pct == 100 else "partial" if pct >= 95 else "down"
+                tip = f"{day}: {pct:.1f}% up ({len(sel)} checks)"
+            bars.append(f'<span class="bar {cls}" title="{html.escape(tip)}"></span>')
+        u24, u7, u30 = uptime(rows, name, 86400), uptime(rows, name, 7 * 86400), uptime(rows, name, 30 * 86400)
+        state = "unknown" if not latest else ("up" if latest["up"] else "down")
+        summary.append({"name": name, "state": state, "uptime_24h": u24, "uptime_7d": u7, "uptime_30d": u30,
+                        "latest": latest})
+        fmt = lambda v: "n/a" if v is None else f"{v:g}%"
+        detail = html.escape(latest["detail"]) if latest else "not checked yet"
+        ms = f" · {latest['ms']} ms" if latest and latest.get("ms") is not None else ""
+        cards.append(f'''<section class="card">
+  <div class="row"><h2>{html.escape(name)}</h2><span class="pill {state}">{state.upper()}</span></div>
+  <p class="detail">{detail}{ms}</p>
+  <div class="bars" aria-label="daily uptime, last {days} days">{"".join(bars)}</div>
+  <p class="meta">Uptime: 24 h {fmt(u24)} · 7 d {fmt(u7)} · 30 d {fmt(u30)}</p>
+</section>''')
+    overall = "All systems operational" if summary and all(s["state"] == "up" for s in summary) else "Some systems are degraded"
+    updated = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+    page = f'''<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="60">
+<title>{html.escape(cfg["title"])}</title><style>
+:root{{--bg:#f7f7f5;--card:#fff;--ink:#1d1d1b;--muted:#6b6b66;--line:#e4e4df;--up:#2e7d32;--partial:#e0a100;--down:#c62828;--none:#d6d6d0}}
+@media (prefers-color-scheme:dark){{:root{{--bg:#151514;--card:#1f1f1d;--ink:#ededea;--muted:#a3a39d;--line:#33332f;--none:#3a3a36}}}}
+*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}}
+main{{max-width:760px;margin:0 auto;padding:32px 16px}}h1{{font-size:24px;margin:0 0 4px}}
+.banner{{padding:14px 16px;border-radius:10px;margin:16px 0 24px;font-weight:600;color:#fff;background:var(--{"up" if overall.startswith("All") else "down"})}}
+.card{{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:12px}}
+.row{{display:flex;justify-content:space-between;align-items:center;gap:8px}}h2{{font-size:16px;margin:0}}
+.pill{{font-size:12px;font-weight:700;padding:2px 8px;border-radius:99px;color:#fff;background:var(--none)}}
+.pill.up{{background:var(--up)}}.pill.down{{background:var(--down)}}
+.detail,.meta,footer{{color:var(--muted);font-size:13px;margin:6px 0}}
+.bars{{display:flex;gap:2px;height:28px;margin:10px 0 4px}}.bar{{flex:1;border-radius:2px;background:var(--none)}}
+.bar.up{{background:var(--up)}}.bar.partial{{background:var(--partial)}}.bar.down{{background:var(--down)}}
+</style></head><body><main>
+<h1>{html.escape(cfg["title"])}</h1><div class="banner">{overall}</div>
+{"".join(cards)}
+<footer>Updated {updated} · generated by pulse {VERSION}</footer>
+</main></body></html>
+'''
+    (out / "index.html").write_text(page)
+    (out / "status.json").write_text(json.dumps({"title": cfg["title"], "updated": updated, "checks": summary}, indent=2))
+    return {"page": str(out / "index.html"), "checks": summary}
+
+
+def print_results(res):
+    for r in res["results"]:
+        ms = f"{r['ms']:>5} ms" if r.get("ms") is not None else "        "
+        print(f"  {'UP  ' if r['up'] else 'DOWN'}  {ms}  {r['name']:<28} {r['detail']}")
+    print("All checks up." if res["all_up"] else "Some checks are DOWN.")
+
+
+def main(argv):
+    cap_mode = bool(argv) and argv[0] in CAPABILITIES
+    if cap_mode:
+        argv = CAPABILITIES[argv[0]] + argv[1:]
+    ap = argparse.ArgumentParser(prog="pulse", description=__doc__.split("\n")[0])
+    ap.add_argument("--version", action="version", version=VERSION)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for name in ("init", "check", "page", "watch", "serve", "unit"):
+        sp = sub.add_parser(name)
+        sp.add_argument("--config", default=DEFAULT_CONFIG)
+        if name == "check":
+            sp.add_argument("--json", action="store_true")
+        if name == "page":
+            sp.add_argument("--out")
+        if name == "watch":
+            sp.add_argument("--interval", type=int, default=60)
+        if name == "serve":
+            sp.add_argument("--port", type=int, default=8080)
+            sp.add_argument("--bind", default="0.0.0.0")
+    a = ap.parse_args(argv)
+    cfg_path = Path(a.config).expanduser().resolve()
+
+    if a.cmd == "init":
+        if cfg_path.exists():
+            raise SystemExit(f"pulse: {cfg_path} already exists")
+        cfg_path.write_text(json.dumps(SAMPLE, indent=2) + "\n")
+        print(f"wrote {cfg_path}; edit the checks, then run: pulse check")
+        return 0
+    if a.cmd == "unit":
+        exe = Path(__file__).resolve()
+        user = os.environ.get("USER", "pi")
+        print(f'''# /etc/systemd/system/pulse.service
+[Unit]
+Description=pulse health checks
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User={user}
+WorkingDirectory={cfg_path.parent}
+EnvironmentFile=-{cfg_path.parent}/.pulse/env
+# leading "-": a DOWN check (exit 1) must not stop the page from being rebuilt
+ExecStart=-{sys.executable} {exe} check --config {cfg_path}
+ExecStartPost={sys.executable} {exe} page --config {cfg_path}
+
+# /etc/systemd/system/pulse.timer
+[Unit]
+Description=run pulse every minute
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=60
+AccuracySec=5
+
+[Install]
+WantedBy=timers.target''')
+        return 0
+
+    cfg = load_config(cfg_path)
+    if a.cmd == "check":
+        res = cmd_check(cfg)
+        if a.json or not sys.stdout.isatty():
+            print(json.dumps(res, indent=2))
+        else:
+            print_results(res)
+        return 0 if res["all_up"] else 1
+    if a.cmd == "page":
+        res = cmd_page(cfg, Path(a.out).expanduser().resolve() if a.out else None)
+        print(f"wrote {res['page']}")
+        return 0
+    if a.cmd == "watch":
+        log(f"checking every {a.interval}s; Ctrl-C to stop")
+        try:
+            while True:
+                res = cmd_check(cfg)
+                cmd_page(cfg, None)
+                down = [r["name"] for r in res["results"] if not r["up"]]
+                log(f"{dt.datetime.now():%H:%M:%S} {len(res['results']) - len(down)}/{len(res['results'])} up" + (f"; down: {', '.join(down)}" if down else ""))
+                time.sleep(a.interval)
+        except KeyboardInterrupt:
+            return 0
+    if a.cmd == "serve":
+        d = cfg["_page_dir"]
+        if not (d / "index.html").is_file():
+            cmd_page(cfg, None)
+        handler = partial(http.server.SimpleHTTPRequestHandler, directory=str(d))
+        log(f"serving {d} on http://{a.bind}:{a.port}/  (Ctrl-C to stop)")
+        try:
+            http.server.ThreadingHTTPServer((a.bind, a.port), handler).serve_forever()
+        except KeyboardInterrupt:
+            return 0
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

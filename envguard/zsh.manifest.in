@@ -1,0 +1,8 @@
+# rw hub manifest for envguard (written by install.sh)
+RW_NAME=envguard
+RW_DESC="Secret scan, env schema and dependency audit"
+RW_ROOT=@ROOT@
+RW_ENTRY=($RW_ROOT/bin/envguard)
+RW_PROVIDES=(audit.security)
+RW_CONSUMES=(repo.path)
+RW_ENV=()

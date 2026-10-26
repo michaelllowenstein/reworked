@@ -1,0 +1,8 @@
+# rw hub manifest for histbook (written by install.sh)
+RW_NAME=histbook
+RW_DESC="Record shell work and render a runbook and script"
+RW_ROOT=@ROOT@
+RW_ENTRY=($RW_ROOT/bin/histbook)
+RW_PROVIDES=(docs.runbook)
+RW_CONSUMES=(shell.history)
+RW_ENV=()

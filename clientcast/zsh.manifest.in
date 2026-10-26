@@ -1,0 +1,8 @@
+# rw hub manifest for clientcast (written by install.sh)
+RW_NAME=clientcast
+RW_DESC="Weekly client update from commits, issues and hours"
+RW_ROOT=@ROOT@
+RW_ENTRY=($RW_ROOT/bin/clientcast)
+RW_PROVIDES=(client.update)
+RW_CONSUMES=(time.report repo.log)
+RW_ENV=()

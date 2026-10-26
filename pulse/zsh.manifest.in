@@ -1,0 +1,8 @@
+# rw hub manifest for pulse (written by install.sh)
+RW_NAME=pulse
+RW_DESC="Health checks, alerts and status page"
+RW_ROOT=@ROOT@
+RW_ENTRY=($RW_ROOT/bin/pulse)
+RW_PROVIDES=(ops.status)
+RW_CONSUMES=(deliver.package)
+RW_ENV=(PULSE_CONFIG=$HOME/pulse/pulse.json)

@@ -1,0 +1,349 @@
+#!/usr/bin/env python3
+"""scopesmith - turn a client brief into scope, milestones, an estimate and a draft SOW.
+
+Usage:
+  scopesmith BRIEF [--client NAME] [--rate 95] [--currency USD] [--out DIR] [--llm] [--json]
+  cat brief.txt | scopesmith - --client "Acme"
+
+BRIEF can be .txt, .md, .eml or .pdf (pdf needs `pdftotext`).
+Writes <out>/scope.json and <out>/sow.md (default out: ./scope-<client-or-brief-name>).
+--llm refines requirement extraction with the Anthropic API when ANTHROPIC_API_KEY is set
+(model from SCOPESMITH_MODEL); otherwise a deterministic keyword engine is used.
+Hub capability: scope.plan (brief text or {"brief": "...", "client": "..."} on stdin)
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import email
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+import urllib.request
+from pathlib import Path
+
+VERSION = "0.1.0"
+CAPABILITIES = {"scope.plan": ["-", "--json"]}
+
+# category: (base hours, phase, keywords)
+CATEGORIES = [
+    ("payments", 20, "core", ["payment", "billing", "stripe", "checkout", "invoice", "subscription", "paypal"]),
+    ("mobile", 24, "core", ["mobile app", "ios", "android", "react native", "flutter"]),
+    ("data", 12, "foundation", ["migrat", "import", "export", "database", "csv", "spreadsheet", "data model", "backup"]),
+    ("integration", 16, "core", ["integrat", "api", "webhook", "sync", "connect to", "zapier", "crm", "hubspot", "salesforce", "quickbooks", "xero", "slack", "google sheets", "mindbody", "shopify"]),
+    ("auth", 12, "foundation", ["login", "log in", "sign in", "sign up", "signup", "auth", "password", "sso", "user account", "roles", "permission"]),
+    ("reporting", 14, "core", ["dashboard", "report", "analytics", "chart", "metrics", "kpi"]),
+    ("notifications", 8, "core", ["email", "notification", "notify", "reminder", "sms", "alert"]),
+    ("search", 10, "core", ["search", "filter", "sort"]),
+    ("admin", 10, "core", ["admin", "back office", "backoffice", "manage users", "cms", "content management"]),
+    ("ui", 10, "core", ["design", "ui", "ux", "page", "screen", "form", "landing", "website", "responsive", "branding"]),
+    ("automation", 10, "core", ["automat", "schedule", "workflow", "cron", "script", "bot"]),
+    ("ai", 16, "core", ["ai", "llm", "gpt", "claude", "chatbot", "machine learning", "classif"]),
+    ("deployment", 6, "launch", ["deploy", "hosting", "server", "domain", "ssl", "docker", "launch", "go live", "production"]),
+    ("testing", 6, "launch", ["test", "qa", "quality"]),
+    ("docs", 4, "launch", ["document", "training", "handover", "handoff", "guide", "manual"]),
+]
+DEFAULT_HOURS = 8
+UP = ["complex", "real-time", "realtime", "multiple", "custom", "advanced", "secure", "scalable", "several", "multi-tenant"]
+DOWN = ["simple", "basic", "small", "minor", "quick"]
+VAGUE = ["etc", "and so on", "something like", "maybe", "possibly", "nice to have", "tbd", "not sure", "flexible", "some kind of"]
+IMPERATIVE = re.compile(r"^(build|create|add|make|develop|implement|set up|setup|integrate|design|migrate|allow|enable|support|send|provide|automate|connect|replace|update|redesign|deploy)\b", re.I)
+REQ_HINT = re.compile(r"\b(need|needs|must|should|want|wants|would like|would love|we'd like|we'd love|require|requires|able to|have to|looking for|expect|include)\b", re.I)
+MONTHS = "january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec"
+
+
+def log(msg):
+    print(f"scopesmith: {msg}", file=sys.stderr)
+
+
+def read_brief(path: str):
+    if path == "-":
+        raw = sys.stdin.read()
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                return data.get("brief") or data.get("text") or "", data
+        except ValueError:
+            pass
+        return raw, {}
+    p = Path(path).expanduser()
+    if p.suffix.lower() == ".pdf":
+        if not shutil.which("pdftotext"):
+            raise SystemExit("scopesmith: install poppler-utils (pdftotext) to read PDFs")
+        return subprocess.run(["pdftotext", "-layout", str(p), "-"], capture_output=True, text=True, check=True).stdout, {}
+    if p.suffix.lower() == ".eml":
+        msg = email.message_from_bytes(p.read_bytes())
+        parts = []
+        for part in msg.walk():
+            if part.get_content_type() == "text/plain":
+                parts.append(part.get_payload(decode=True).decode(part.get_content_charset() or "utf-8", "replace"))
+        return f"Subject: {msg.get('subject', '')}\n\n" + "\n".join(parts), {}
+    return p.read_text(errors="replace"), {}
+
+
+def sentences(lines):
+    flat = re.sub(r"\s+", " ", " ".join(lines))
+    for sent in re.split(r"(?<=[.!?])\s+", flat):
+        for clause in re.split(r",\s+and\s+|;\s+", sent):
+            c = clause.strip().rstrip(".!?")
+            if 12 < len(c) < 300 and not c.lower().startswith(("hi", "hello", "thanks", "regards", "subject:")):
+                yield c
+
+
+def candidates(text: str):
+    out, prose = [], []
+    for raw in text.splitlines():
+        line = raw.strip()
+        bullet = re.match(r"^([-*\u2022]|\d+[.)]|\[[ x]\])\s+(.*)", line)
+        if bullet:
+            if len(bullet.group(2).strip()) > 3:
+                out.append(bullet.group(2).strip())
+        else:
+            prose.append(line)
+    if len(out) < 3:
+        out += [c for c in sentences(prose) if REQ_HINT.search(c) or IMPERATIVE.match(c)]
+    else:
+        # bullets carry the core list; pick up extra deliverables mentioned in prose (hosting, training...)
+        covered = {classify(i)[0] for i in out}
+        for c in sentences(prose):
+            if not (REQ_HINT.search(c) or IMPERATIVE.match(c)):
+                continue
+            if re.search(r"[$\u20ac\u00a3]\s?\d|\b(%s)\b|\d{4}-\d{2}" % MONTHS, c, re.I):
+                continue  # budget or deadline sentence, captured separately
+            cat = classify(c)[0]
+            if cat != "feature" and cat not in covered:
+                covered.add(cat)
+                out.append(c)
+    clean, seen = [], set()
+    for item in out:
+        key = re.sub(r"\W+", " ", item.lower()).strip()
+        if key and key not in seen:
+            seen.add(key)
+            item = item.rstrip(".")
+            clean.append(item[0].upper() + item[1:])
+    return clean
+
+
+def classify(item: str):
+    low = f" {item.lower()} "
+    best = None
+    for name, hours, phase, kws in CATEGORIES:
+        for kw in kws:
+            pat = r"\b" + re.escape(kw) + r"\b" if len(kw) <= 3 else re.escape(kw)
+            if re.search(pat, low):
+                best = (name, hours, phase)
+                break
+        if best:
+            break
+    name, hours, phase = best or ("feature", DEFAULT_HOURS, "core")
+    mult = 1.0
+    if any(re.search(r"\b" + re.escape(w) + r"\b", low) for w in UP):
+        mult *= 1.5
+    if any(re.search(r"\b" + re.escape(w) + r"\b", low) for w in DOWN):
+        mult *= 0.75
+    return name, hours * mult, phase
+
+
+def find_deadline(text: str):
+    low = text
+    m = re.search(r"\b(?:by|before|deadline|due|launch(?:ing)? (?:on|in|by))\s+(?:the\s+)?(?:end of\s+)?((?:%s)\w*(?:\s+\d{1,2}(?:st|nd|rd|th)?)?(?:,?\s+\d{4})?)" % MONTHS, low, re.I)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r"\b(?:within|in)\s+(\d+|two|three|four|six|eight)\s+(weeks?|months?)\b", low, re.I)
+    if m:
+        return f"{m.group(1)} {m.group(2)}"
+    m = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", text)
+    return m.group(1) if m else None
+
+
+def find_budget(text: str):
+    m = re.search(r"(?:budget|up to|max(?:imum)?|around|about)\D{0,20}([$€£]\s?\d[\d,]*(?:\.\d+)?\s?[kK]?)", text)
+    if not m:
+        m = re.search(r"([$€£]\s?\d[\d,]*(?:\.\d+)?\s?[kK]?)", text)
+    return m.group(1).replace(" ", "") if m else None
+
+
+def llm_items(text: str):
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if not key:
+        log("--llm ignored: ANTHROPIC_API_KEY not set")
+        return None
+    model = os.environ.get("SCOPESMITH_MODEL", "claude-sonnet-5-5")
+    prompt = ("Extract the concrete deliverables from this client brief. Reply with only a JSON array of "
+              "objects {\"item\": short imperative description, \"hours\": realistic senior-freelancer estimate}. "
+              "Exclude project management, QA and contingency.\n\nBRIEF:\n" + text[:20000])
+    body = json.dumps({"model": model, "max_tokens": 2000, "messages": [{"role": "user", "content": prompt}]}).encode()
+    req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=body, headers={
+        "x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=90) as r:
+            data = json.loads(r.read())
+        txt = "".join(b.get("text", "") for b in data.get("content", []))
+        arr = json.loads(txt[txt.index("["): txt.rindex("]") + 1])
+        return [(str(x["item"]), float(x["hours"])) for x in arr if "item" in x and "hours" in x]
+    except Exception as e:  # noqa: BLE001 - fall back to the keyword engine on any failure
+        log(f"LLM extraction failed ({e}); using keyword engine")
+        return None
+
+
+def round_h(x):
+    return math.ceil(x * 2) / 2
+
+
+def build_scope(text: str, client: str, rate: float, currency: str, use_llm: bool):
+    items = []
+    llm = llm_items(text) if use_llm else None
+    if llm:
+        for desc, hrs in llm:
+            cat, _, phase = classify(desc)
+            items.append({"item": desc, "category": cat, "phase": phase, "hours": round_h(hrs), "source": "llm"})
+    else:
+        for desc in candidates(text):
+            cat, hrs, phase = classify(desc)
+            items.append({"item": desc, "category": cat, "phase": phase, "hours": round_h(hrs), "source": "keywords"})
+    build = sum(i["hours"] for i in items)
+    overhead = [
+        {"item": "Discovery, setup and environments", "hours": 6.0},
+        {"item": "QA and bug fixing (15%)", "hours": round_h(build * 0.15)},
+        {"item": "Project management and client communication (10%)", "hours": round_h(build * 0.10)},
+    ]
+    subtotal = build + sum(o["hours"] for o in overhead)
+    contingency = round_h(subtotal * 0.20)
+    total = subtotal + contingency
+    low, high = round_h(total * 0.85), round_h(total * 1.3)
+
+    phases = [("foundation", "Foundation", 0.30), ("core", "Core features", 0.40), ("launch", "Launch and handoff", 0.30)]
+    milestones = []
+    for key, label, share in phases:
+        its = [i["item"] for i in items if i["phase"] == key]
+        if key == "foundation":
+            its = ["Discovery, setup and environments"] + its
+        if key == "launch":
+            its = its + ["QA pass and fixes", "Deployment and handoff documentation"]
+        hrs = sum(i["hours"] for i in items if i["phase"] == key)
+        milestones.append({"name": label, "deliverables": its, "build_hours": hrs, "payment_percent": int(share * 100)})
+
+    deadline, budget = find_deadline(text), find_budget(text)
+    questions = []
+    if not deadline:
+        questions.append("What is the target launch date, and is it fixed?")
+    if not budget:
+        questions.append("Is there a budget range we should design the scope around?")
+    low_text = text.lower()
+    for w in VAGUE:
+        if re.search(r"\b" + re.escape(w) + r"\b", low_text):
+            questions.append(f"The brief says \"{w}\" - which items are in scope for v1, and which can wait?")
+            break
+    if not any(i["category"] == "deployment" for i in items):
+        questions.append("Where will this be hosted, and who owns the accounts (domain, hosting, email)?")
+    if any(i["category"] == "integration" for i in items):
+        questions.append("Can you provide API access or sandbox credentials for each third-party system?")
+    if not items:
+        questions.append("The brief has no clear deliverables - can you list the must-have features?")
+    weeks = max(1, math.ceil(total / 25))
+    return {
+        "tool": "scopesmith", "version": VERSION,
+        "generated": dt.date.today().isoformat(),
+        "client": client, "rate": rate, "currency": currency,
+        "items": items, "overhead": overhead, "contingency_hours": contingency,
+        "hours": {"build": build, "total": total, "low": low, "high": high},
+        "price": {"total": round(total * rate, 2), "low": round(low * rate, 2), "high": round(high * rate, 2)},
+        "timeline_weeks_at_25h": weeks,
+        "milestones": milestones,
+        "detected": {"deadline": deadline, "budget": budget},
+        "open_questions": questions,
+    }
+
+
+def money(x, cur):
+    sym = {"USD": "$", "CAD": "CA$", "EUR": "€", "GBP": "£", "AUD": "A$"}.get(cur.upper(), cur + " ")
+    return f"{sym}{x:,.0f}"
+
+
+def sow_md(s):
+    cur = s["currency"]
+    L = [f"# Statement of Work (draft): {s['client']}", "",
+         f"Prepared {s['generated']}. Rate {money(s['rate'], cur)}/hour. All estimates are ranges until the open questions below are answered.", "",
+         "## Summary", "",
+         f"- Estimated effort: **{s['hours']['low']:g}-{s['hours']['high']:g} hours** (planning figure {s['hours']['total']:g} h)",
+         f"- Estimated fee: **{money(s['price']['low'], cur)}-{money(s['price']['high'], cur)}**",
+         f"- Timeline: about **{s['timeline_weeks_at_25h']} week(s)** at 25 hours/week"]
+    if s["detected"]["deadline"]:
+        L.append(f"- Client deadline mentioned: {s['detected']['deadline']}")
+    if s["detected"]["budget"]:
+        L.append(f"- Client budget mentioned: {s['detected']['budget']}")
+    L += ["", "## Scope", "", "| # | Deliverable | Category | Hours |", "| --- | --- | --- | --- |"]
+    for n, i in enumerate(s["items"], 1):
+        L.append(f"| {n} | {i['item']} | {i['category']} | {i['hours']:g} |")
+    for o in s["overhead"]:
+        L.append(f"| | {o['item']} | overhead | {o['hours']:g} |")
+    L.append(f"| | Contingency (20%) | overhead | {s['contingency_hours']:g} |")
+    L.append(f"| | **Total** | | **{s['hours']['total']:g}** |")
+    L += ["", "## Milestones and payments", ""]
+    for n, m in enumerate(s["milestones"], 1):
+        L.append(f"{n}. **{m['name']}** ({m['payment_percent']}% of fee on acceptance)")
+        L += [f"    - {d}" for d in m["deliverables"]]
+    L += ["", "## Out of scope", "",
+          "- Anything not listed under Scope; new requests are estimated separately as change requests.",
+          "- Third-party fees (hosting, licences, API usage) are paid by the client.", "",
+          "## Open questions", ""]
+    L += [f"- [ ] {q}" for q in s["open_questions"]] or ["- None"]
+    L += ["", "## Acceptance", "",
+          "Each milestone is accepted when its deliverables are demonstrated and the client confirms in writing, "
+          "or 5 business days pass without reported defects.", ""]
+    return "\n".join(L)
+
+
+def slug(s):
+    return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-") or "client"
+
+
+def main(argv):
+    cap_mode = bool(argv) and argv[0] in CAPABILITIES
+    if cap_mode:
+        argv = CAPABILITIES[argv[0]] + argv[1:]
+    ap = argparse.ArgumentParser(prog="scopesmith", description=__doc__.split("\n")[0])
+    ap.add_argument("brief", help="brief file, or - for stdin")
+    ap.add_argument("--client", help="client name (default: brief file name)")
+    ap.add_argument("--rate", type=float, default=float(os.environ.get("SCOPESMITH_RATE", 95)))
+    ap.add_argument("--currency", default=os.environ.get("SCOPESMITH_CURRENCY", "USD"))
+    ap.add_argument("--out", help="output dir")
+    ap.add_argument("--llm", action="store_true", help="use the Anthropic API for extraction")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--version", action="version", version=VERSION)
+    a = ap.parse_args(argv)
+
+    text, meta = read_brief(a.brief)
+    client = a.client or meta.get("client") or (Path(a.brief).stem if a.brief != "-" else "Client")
+    rate = float(meta.get("rate", a.rate))
+    scope = build_scope(text, client, rate, a.currency, a.llm)
+
+    if not cap_mode or a.out:
+        out = Path(a.out or f"scope-{slug(client)}").expanduser()
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "scope.json").write_text(json.dumps(scope, indent=2) + "\n")
+        (out / "sow.md").write_text(sow_md(scope))
+        scope["files"] = {"scope": str((out / "scope.json").resolve()), "sow": str((out / "sow.md").resolve())}
+        log(f"wrote {out}/scope.json and {out}/sow.md")
+
+    if a.json or not sys.stdout.isatty():
+        print(json.dumps(scope, indent=2))
+    else:
+        cur = a.currency
+        print(f"{client}: {len(scope['items'])} deliverables, {scope['hours']['low']:g}-{scope['hours']['high']:g} h, "
+              f"{money(scope['price']['low'], cur)}-{money(scope['price']['high'], cur)}, ~{scope['timeline_weeks_at_25h']} weeks")
+        for i in scope["items"]:
+            print(f"  {i['hours']:>5g} h  [{i['category']:<13}] {i['item']}")
+        if scope["open_questions"]:
+            print("Open questions:")
+            for q in scope["open_questions"]:
+                print(f"  - {q}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

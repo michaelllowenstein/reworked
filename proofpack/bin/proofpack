@@ -1,0 +1,378 @@
+#!/usr/bin/env python3
+"""proofpack - turn a repository into a verifiable, Reworkio-ready case study.
+
+Usage:
+  proofpack [REPO] [--out DIR] [--test-cmd CMD] [--no-tests] [--record] [--json]
+
+Writes <REPO>/proof/ with:
+  proof.json       machine-readable evidence (commits, languages, tests, checksum)
+  case-study.md    human-readable case study to paste into Reworkio
+  badge-tests.svg  test status badge
+Hub capability: proof.pack
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from collections import Counter, defaultdict
+from pathlib import Path
+
+VERSION = "0.1.0"
+CAPABILITIES = {"proof.pack": ["--json"]}
+
+LANG_BY_EXT = {
+    ".py": "Python", ".js": "JavaScript", ".mjs": "JavaScript", ".cjs": "JavaScript",
+    ".ts": "TypeScript", ".tsx": "TypeScript", ".jsx": "JavaScript", ".go": "Go",
+    ".rs": "Rust", ".rb": "Ruby", ".java": "Java", ".kt": "Kotlin", ".swift": "Swift",
+    ".c": "C", ".h": "C", ".cpp": "C++", ".cc": "C++", ".hpp": "C++", ".cs": "C#",
+    ".php": "PHP", ".sh": "Shell", ".bash": "Shell", ".zsh": "Shell", ".lua": "Lua",
+    ".html": "HTML", ".css": "CSS", ".scss": "CSS", ".sql": "SQL", ".vue": "Vue",
+    ".svelte": "Svelte", ".dart": "Dart", ".ex": "Elixir", ".exs": "Elixir",
+    ".tf": "Terraform", ".nix": "Nix", ".md": "Markdown", ".yml": "YAML", ".yaml": "YAML",
+    ".toml": "TOML", ".json": "JSON",
+}
+SHELL_NAMES = {"Makefile": "Make", "Dockerfile": "Docker"}
+SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", "dist", "build",
+             "target", ".next", ".cache", "proof", ".tox", ".mypy_cache", ".pytest_cache"}
+DOC_LANGS = {"Markdown", "YAML", "TOML", "JSON"}
+
+
+def run(cmd, cwd=None, timeout=60, check=False):
+    try:
+        p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout,
+                           shell=isinstance(cmd, str))
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        if check:
+            raise
+        return 127, "", str(e)
+    return p.returncode, p.stdout, p.stderr
+
+
+def log(msg):
+    print(f"proofpack: {msg}", file=sys.stderr)
+
+
+def git(repo, *args, timeout=60):
+    code, out, _ = run(["git", "-C", str(repo), *args], timeout=timeout)
+    return out if code == 0 else None
+
+
+def list_files(repo: Path, is_git: bool):
+    if is_git:
+        out = git(repo, "ls-files", "-z")
+        if out is not None:
+            return [repo / f for f in out.split("\0") if f and not f.startswith("proof/")]
+    files = []
+    for root, dirs, names in os.walk(repo):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        files.extend(Path(root) / n for n in names)
+    return files
+
+
+def languages(files):
+    lines = Counter()
+    for f in files:
+        lang = LANG_BY_EXT.get(f.suffix.lower()) or SHELL_NAMES.get(f.name)
+        if not lang or not f.is_file():
+            continue
+        try:
+            if f.stat().st_size > 2_000_000:
+                continue
+            with open(f, "rb") as fh:
+                lines[lang] += sum(1 for _ in fh)
+        except OSError:
+            continue
+    code = {k: v for k, v in lines.items() if k not in DOC_LANGS}
+    total = sum(code.values()) or 1
+    return [{"language": k, "lines": v, "percent": round(100 * v / total, 1)}
+            for k, v in sorted(code.items(), key=lambda kv: -kv[1])], dict(lines)
+
+
+def readme_summary(repo: Path):
+    for name in ("README.md", "README.rst", "README.txt", "README", "readme.md"):
+        p = repo / name
+        if p.is_file():
+            text = p.read_text(errors="replace")
+            title = None
+            for line in text.splitlines():
+                if line.startswith("# "):
+                    title = line[2:].strip()
+                    break
+            paras = [x.strip() for x in re.split(r"\n\s*\n", text)]
+            for para in paras:
+                if not para or para.startswith(("#", "!", "[!", "<", "```", "|", "=", "-")):
+                    continue
+                return title, " ".join(para.split())[:600]
+            return title, None
+    return None, None
+
+
+def commit_stats(repo: Path):
+    out = git(repo, "log", "--no-merges", "--date=short", "--pretty=format:%H%x09%ad%x09%an%x09%s")
+    if not out:
+        return None
+    rows = [l.split("\t", 3) for l in out.splitlines() if l.count("\t") >= 3]
+    if not rows:
+        return None
+    dates = [dt.date.fromisoformat(r[1]) for r in rows]
+    authors = Counter(r[2] for r in rows)
+    today = dt.date.today()
+    weeks = defaultdict(int)
+    for d in dates:
+        w = (today - d).days // 7
+        if w < 12:
+            weeks[w] += 1
+    kinds = Counter()
+    for r in rows:
+        m = re.match(r"^(\w+)(\(.+?\))?!?:", r[3])
+        kinds[m.group(1).lower() if m else "other"] += 1
+    return {
+        "total": len(rows),
+        "first": min(dates).isoformat(),
+        "last": max(dates).isoformat(),
+        "active_days": len(set(dates)),
+        "authors": len(authors),
+        "per_week_last_12": [weeks.get(i, 0) for i in range(11, -1, -1)],
+        "by_type": dict(kinds.most_common()),
+        "recent": [{"sha": r[0][:8], "date": r[1], "subject": r[3]} for r in rows[:8]],
+        "head": rows[0][0],
+    }
+
+
+def detect_test_cmd(repo: Path):
+    pj = repo / "package.json"
+    if pj.is_file():
+        try:
+            scripts = json.loads(pj.read_text()).get("scripts", {})
+            t = scripts.get("test", "")
+            if t and "no test specified" not in t:
+                return "npm test --silent"
+        except (ValueError, OSError):
+            pass
+    has_pytest = run([sys.executable, "-c", "import pytest"])[0] == 0
+    pyproject = (repo / "pyproject.toml").read_text(errors="ignore") if (repo / "pyproject.toml").exists() else ""
+    if has_pytest and ((repo / "pytest.ini").exists() or (repo / "conftest.py").exists() or "pytest" in pyproject):
+        return f"{sys.executable} -m pytest -q"
+    if (repo / "tests").is_dir() and any((repo / "tests").glob("test_*.py")):
+        if run([sys.executable, "-c", "import pytest"])[0] == 0:
+            return f"{sys.executable} -m pytest -q"
+        return f"{sys.executable} -m unittest discover -s tests -q"
+    mk = repo / "Makefile"
+    if mk.is_file() and re.search(r"^test:", mk.read_text(errors="ignore"), re.M):
+        return "make test"
+    if (repo / "go.mod").exists():
+        return "go test ./..."
+    if (repo / "Cargo.toml").exists():
+        return "cargo test --quiet"
+    if (repo / "tests").is_dir() and any((repo / "tests").glob("*.sh")):
+        return "for t in tests/*.sh; do bash \"$t\" || exit 1; done"
+    return None
+
+
+def run_tests(repo: Path, cmd: str):
+    log(f"running tests: {cmd}")
+    start = time.time()
+    try:
+        p = subprocess.run(cmd, cwd=repo, shell=True, capture_output=True, text=True, timeout=900)
+        code, out = p.returncode, (p.stdout + p.stderr)
+    except subprocess.TimeoutExpired:
+        code, out = 124, "timed out after 900s"
+    summary = None
+    for pat in (r"(\d+ passed.*?)(?:\s+in\s+[\d.]+s)?\s*=*$", r"(Ran \d+ tests?)", r"(Tests?:\s+.*)",
+                r"(test result: .*)", r"(ok\s+\S+.*)"):
+        m = re.search(pat, out, re.M)
+        if m:
+            summary = m.group(1).strip()
+            break
+    return {
+        "command": cmd,
+        "passed": code == 0,
+        "exit_code": code,
+        "duration_s": round(time.time() - start, 1),
+        "summary": summary,
+        "output_tail": "\n".join(out.strip().splitlines()[-15:]),
+    }
+
+
+def checksum(repo: Path, is_git: bool, files):
+    if is_git:
+        try:
+            p = subprocess.run(["git", "-C", str(repo), "archive", "--format=tar", "HEAD"],
+                               capture_output=True, timeout=120)
+            if p.returncode == 0:
+                return "git-archive-HEAD", hashlib.sha256(p.stdout).hexdigest()
+        except subprocess.TimeoutExpired:
+            pass
+    h = hashlib.sha256()
+    for f in sorted(files):
+        if f.is_file():
+            h.update(str(f.relative_to(repo)).encode())
+            h.update(hashlib.sha256(f.read_bytes()).digest())
+    return "file-tree", h.hexdigest()
+
+
+def badge(label, value, color):
+    lw, vw = 6 * len(label) + 12, 6 * len(value) + 12
+    return f'''<svg xmlns="http://www.w3.org/2000/svg" width="{lw + vw}" height="20" role="img" aria-label="{label}: {value}">
+<rect width="{lw}" height="20" fill="#555"/><rect x="{lw}" width="{vw}" height="20" fill="{color}"/>
+<g fill="#fff" font-family="Verdana,DejaVu Sans,sans-serif" font-size="11" text-anchor="middle">
+<text x="{lw / 2}" y="14">{label}</text><text x="{lw + vw / 2}" y="14">{value}</text></g></svg>
+'''
+
+
+def spark(values):
+    blocks = "▁▂▃▄▅▆▇█"
+    m = max(values) or 1
+    return "".join(blocks[min(7, int(v / m * 7))] if v else "·" for v in values)
+
+
+def record_demo(repo: Path, out: Path):
+    tape = repo / "demo.tape"
+    if not tape.exists():
+        return {"status": "skipped", "reason": "no demo.tape in repo root"}
+    if not shutil.which("vhs"):
+        return {"status": "skipped", "reason": "vhs not installed (https://github.com/charmbracelet/vhs)"}
+    code, _, err = run(["vhs", str(tape)], cwd=repo, timeout=600)
+    gifs = sorted(repo.glob("*.gif"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if code == 0 and gifs:
+        dest = out / "demo.gif"
+        shutil.copy2(gifs[0], dest)
+        return {"status": "recorded", "file": str(dest)}
+    return {"status": "failed", "reason": err.strip()[-300:]}
+
+
+def case_study(p):
+    lines = [f"# {p['title']}", ""]
+    if p["summary"]:
+        lines += [p["summary"], ""]
+    lines += ["## Evidence", ""]
+    t = p.get("tests")
+    if t:
+        state = "passing" if t["passed"] else "FAILING"
+        lines.append(f"- **Tests:** {state} (`{t['command']}`, {t['duration_s']}s)"
+                     + (f" - {t['summary']}" if t["summary"] else ""))
+    c = p.get("commits")
+    if c:
+        lines.append(f"- **History:** {c['total']} commits over {c['active_days']} active days "
+                     f"({c['first']} to {c['last']}), {c['authors']} author(s)")
+        lines.append(f"- **Last 12 weeks:** `{spark(c['per_week_last_12'])}`")
+    if p["languages"]:
+        langs = ", ".join(f"{l['language']} {l['percent']}%" for l in p["languages"][:5])
+        lines.append(f"- **Stack:** {langs} ({p['code_lines']:,} lines of code)")
+    lines.append(f"- **Checksum:** `sha256:{p['checksum']['sha256'][:16]}...` ({p['checksum']['method']})")
+    if p.get("remote"):
+        lines.append(f"- **Source:** {p['remote']}")
+    if p.get("demo", {}).get("status") == "recorded":
+        lines += ["", "![demo](demo.gif)"]
+    if c and c["recent"]:
+        lines += ["", "## Recent work", ""]
+        lines += [f"- {r['date']} `{r['sha']}` {r['subject']}" for r in c["recent"]]
+    lines += ["", "## Verify it yourself", "", "```sh"]
+    if p.get("remote"):
+        lines.append(f"git clone {p['remote']} && cd {Path(p['repo']).name}")
+    if c:
+        lines.append(f"git checkout {c['head'][:12]}")
+        lines.append("git archive --format=tar HEAD | sha256sum   # matches the checksum above")
+    if t:
+        lines.append(t["command"].replace(sys.executable, "python3"))
+    lines += ["```", "", f"_Generated by proofpack {VERSION} on {p['generated']}._", ""]
+    return "\n".join(lines)
+
+
+def main(argv):
+    cap_mode = bool(argv) and argv[0] in CAPABILITIES
+    if cap_mode:
+        argv = CAPABILITIES[argv[0]] + argv[1:]
+    ap = argparse.ArgumentParser(prog="proofpack", description=__doc__.split("\n")[0])
+    ap.add_argument("repo", nargs="?", default=".")
+    ap.add_argument("--out", help="output dir (default REPO/proof)")
+    ap.add_argument("--test-cmd", help="override the detected test command")
+    ap.add_argument("--no-tests", action="store_true", help="skip running tests")
+    ap.add_argument("--record", action="store_true", help="record demo.tape with vhs if available")
+    ap.add_argument("--json", action="store_true", help="print proof.json to stdout")
+    ap.add_argument("--version", action="version", version=VERSION)
+    a = ap.parse_args(argv)
+
+    if cap_mode and a.repo == "." and not sys.stdin.isatty():
+        try:
+            data = json.loads(sys.stdin.read() or "{}")
+            a.repo = data.get("repo") or data.get("path") or a.repo
+        except ValueError:
+            pass
+
+    repo = Path(a.repo).expanduser().resolve()
+    if not repo.is_dir():
+        log(f"not a directory: {repo}")
+        return 2
+    top = git(repo, "rev-parse", "--show-toplevel")
+    is_git = top is not None
+    if is_git:
+        repo = Path(top.strip())
+    out = Path(a.out).expanduser().resolve() if a.out else repo / "proof"
+    out.mkdir(parents=True, exist_ok=True)
+
+    files = list_files(repo, is_git)
+    langs, all_lines = languages(files)
+    title, summary = readme_summary(repo)
+    remote = (git(repo, "remote", "get-url", "origin") or "").strip() or None
+    if remote and remote.startswith("git@github.com:"):
+        remote = "https://github.com/" + remote.split(":", 1)[1]
+    if remote and remote.endswith(".git"):
+        remote = remote[:-4]
+
+    proof = {
+        "tool": "proofpack", "version": VERSION,
+        "generated": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat(),
+        "repo": str(repo), "title": title or repo.name, "summary": summary, "remote": remote,
+        "files": len(files),
+        "code_lines": sum(l["lines"] for l in langs),
+        "languages": langs,
+        "commits": commit_stats(repo) if is_git else None,
+        "dirty": bool((git(repo, "status", "--porcelain") or "").strip()) if is_git else None,
+    }
+    if not a.no_tests:
+        cmd = a.test_cmd or detect_test_cmd(repo)
+        proof["tests"] = run_tests(repo, cmd) if cmd else None
+        if not cmd:
+            log("no test command detected (use --test-cmd)")
+    method, digest = checksum(repo, is_git, files)
+    proof["checksum"] = {"method": method, "sha256": digest}
+    if a.record:
+        proof["demo"] = record_demo(repo, out)
+
+    t = proof.get("tests")
+    if t:
+        b = badge("tests", "passing" if t["passed"] else "failing", "#2e7d32" if t["passed"] else "#c62828")
+    else:
+        b = badge("tests", "none", "#9e9e9e")
+    (out / "badge-tests.svg").write_text(b)
+    (out / "proof.json").write_text(json.dumps(proof, indent=2) + "\n")
+    (out / "case-study.md").write_text(case_study(proof))
+
+    if a.json or not sys.stdout.isatty():
+        print(json.dumps(proof, indent=2))
+    else:
+        print(f"Proof pack written to {out}")
+        print(f"  title     {proof['title']}")
+        if proof["commits"]:
+            c = proof["commits"]
+            print(f"  history   {c['total']} commits, {c['first']} to {c['last']}  {spark(c['per_week_last_12'])}")
+        print(f"  stack     " + ", ".join(f"{l['language']} {l['percent']}%" for l in langs[:4]))
+        if t:
+            print(f"  tests     {'PASS' if t['passed'] else 'FAIL'} ({t['command']}, {t['duration_s']}s)")
+        print(f"  checksum  {digest[:16]}... ({method})")
+        if proof["dirty"]:
+            print("  warning   uncommitted changes are not covered by the checksum")
+    return 0 if (not t or t["passed"]) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

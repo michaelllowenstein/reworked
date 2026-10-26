@@ -1,0 +1,412 @@
+#!/usr/bin/env python3
+"""handoff - package a project for client delivery.
+
+Usage:
+  handoff check   [DIR]                         readiness checklist (exit 1 on blockers)
+  handoff env     [DIR]                         write .env.example from .env with values stripped
+  handoff runbook [DIR] [--client NAME]         write HANDOFF.md (install, configure, run, update, secrets)
+  handoff sync    SRC DST [--apply] [--exclude PATTERN ...] [--keep-extra]
+                                                 mirror SRC to DST; dry run unless --apply
+  handoff package [DIR] [--client NAME] [--out DIR]
+                                                 tar.gz of tracked files + HANDOFF.md + .env.example + SHA256SUMS
+Hub capability: deliver.package (stdin JSON may carry {"dir": "...", "client": "..."})
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import fnmatch
+import hashlib
+import io
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+from pathlib import Path
+
+VERSION = "0.1.0"
+CAPABILITIES = {"deliver.package": ["package", "--json"]}
+DEFAULT_EXCLUDES = [".git", ".env", ".env.*", "!.env.example", "node_modules", "__pycache__", ".venv", "venv",
+                    ".DS_Store", "*.pyc", "proof", "dist", "build", ".pytest_cache", ".mypy_cache"]
+SECRET_KEY = re.compile(r"(KEY|SECRET|TOKEN|PASS|PASSWORD|PRIVATE|CREDENTIAL|DSN|DATABASE_URL|AUTH)", re.I)
+
+
+def log(msg):
+    print(f"handoff: {msg}", file=sys.stderr)
+
+
+def git(d, *args):
+    try:
+        p = subprocess.run(["git", "-C", str(d), *args], capture_output=True, text=True, timeout=60)
+        return p.stdout if p.returncode == 0 else None
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+
+
+def parse_env(path: Path):
+    out = {}
+    if not path.is_file():
+        return out
+    for line in path.read_text(errors="replace").splitlines():
+        s = line.strip()
+        if not s or s.startswith("#") or "=" not in s:
+            continue
+        k, v = s.split("=", 1)
+        k = k.replace("export ", "").strip()
+        out[k] = v.strip().strip('"').strip("'")
+    return out
+
+
+def env_keys_with_comments(path: Path):
+    """Return lines of .env with values stripped, keeping comments and blank lines."""
+    lines = []
+    for line in path.read_text(errors="replace").splitlines():
+        s = line.strip()
+        if not s or s.startswith("#") or "=" not in s:
+            lines.append(line)
+            continue
+        k, v = s.split("=", 1)
+        k = k.replace("export ", "").strip()
+        v = v.strip().strip('"').strip("'")
+        keep = v if (v and not SECRET_KEY.search(k) and re.fullmatch(r"(true|false|\d+|development|production|dev|prod|info|debug|warn|localhost)", v, re.I)) else ""
+        lines.append(f"{k}={keep}")
+    return lines
+
+
+def detect_stack(d: Path):
+    stack = {"install": [], "run": [], "test": [], "notes": []}
+    pj = d / "package.json"
+    if pj.is_file():
+        try:
+            scripts = json.loads(pj.read_text()).get("scripts", {})
+        except ValueError:
+            scripts = {}
+        pm = "pnpm" if (d / "pnpm-lock.yaml").exists() else "yarn" if (d / "yarn.lock").exists() else "npm"
+        stack["install"].append(f"{pm} install" if pm != "npm" else "npm ci" if (d / "package-lock.json").exists() else "npm install")
+        for k in ("build", "start", "dev"):
+            if k in scripts:
+                stack["run"].append(f"{pm} run {k}")
+        if "test" in scripts:
+            stack["test"].append(f"{pm} test")
+    if (d / "requirements.txt").is_file():
+        stack["install"] += ["python3 -m venv .venv && . .venv/bin/activate", "pip install -r requirements.txt"]
+    elif (d / "pyproject.toml").is_file():
+        stack["install"] += ["python3 -m venv .venv && . .venv/bin/activate", "pip install -e ."]
+    if (d / "tests").is_dir() and any((d / "tests").glob("test_*.py")):
+        stack["test"].append("python3 -m pytest -q")
+    mk = d / "Makefile"
+    if mk.is_file():
+        targets = re.findall(r"^([a-zA-Z0-9_-]+):", mk.read_text(errors="ignore"), re.M)
+        for t in targets:
+            if t in ("install", "setup", "deps"):
+                stack["install"].append(f"make {t}")
+            elif t in ("run", "start", "serve", "up"):
+                stack["run"].append(f"make {t}")
+            elif t in ("test", "check"):
+                stack["test"].append(f"make {t}")
+    for dc in ("docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"):
+        if (d / dc).is_file():
+            stack["run"].append("docker compose up -d")
+            break
+    if (d / "Dockerfile").is_file() and not any("docker" in r for r in stack["run"]):
+        stack["notes"].append("A Dockerfile is included: `docker build -t app .`")
+    if (d / "go.mod").is_file():
+        stack["install"].append("go mod download")
+        stack["test"].append("go test ./...")
+    if (d / "bin").is_dir():
+        for f in sorted((d / "bin").iterdir()):
+            if f.is_file() and os.access(f, os.X_OK):
+                stack["run"].append(f"./bin/{f.name} --help")
+    for k in stack:
+        stack[k] = list(dict.fromkeys(stack[k]))
+    return stack
+
+
+def readme_title(d: Path):
+    for n in ("README.md", "README", "readme.md"):
+        p = d / n
+        if p.is_file():
+            text = p.read_text(errors="replace")
+            m = re.search(r"^#\s+(.+)$", text, re.M)
+            paras = [x.strip() for x in re.split(r"\n\s*\n", text) if x.strip() and not x.strip().startswith(("#", "!", "```", "<"))]
+            return (m.group(1).strip() if m else d.name), (" ".join(paras[0].split()) if paras else "")
+    return d.name, ""
+
+
+def cmd_check(d: Path):
+    is_git = git(d, "rev-parse", "--show-toplevel") is not None
+    tracked = set((git(d, "ls-files") or "").splitlines()) if is_git else set()
+    checks = []
+
+    def add(name, status, detail=""):
+        checks.append({"check": name, "status": status, "detail": detail})
+
+    add("README present", "pass" if any((d / n).is_file() for n in ("README.md", "README", "readme.md")) else "fail")
+    env_present = (d / ".env").is_file()
+    example = (d / ".env.example").is_file()
+    if env_present or example:
+        add(".env.example present", "pass" if example else "fail", "" if example else "run: handoff env")
+    if env_present and example:
+        missing = sorted(set(parse_env(d / ".env")) - set(parse_env(d / ".env.example")))
+        add(".env.example covers every .env key", "pass" if not missing else "fail", ", ".join(missing))
+    if is_git:
+        leaked = sorted(f for f in tracked if re.search(r"(^|/)\.env($|\.(?!example$|sample$|template$|schema$))", f))
+        add("No .env files tracked by git", "pass" if not leaked else "fail", ", ".join(leaked))
+        dirty = (git(d, "status", "--porcelain") or "").strip()
+        add("Working tree clean", "pass" if not dirty else "warn", f"{len(dirty.splitlines())} uncommitted change(s)" if dirty else "")
+        tags = (git(d, "tag", "--points-at", "HEAD") or "").strip()
+        add("HEAD is tagged as a release", "pass" if tags else "warn", tags or "suggest: git tag v1.0.0")
+    else:
+        add("Project under version control", "warn", "git init recommended")
+    stack = detect_stack(d)
+    add("Install steps detectable", "pass" if stack["install"] else "warn", "; ".join(stack["install"]))
+    add("Test command detectable", "pass" if stack["test"] else "warn", "; ".join(stack["test"]))
+    add("LICENSE or terms present", "pass" if any((d / n).exists() for n in ("LICENSE", "LICENSE.md", "TERMS.md")) else "warn")
+    add("HANDOFF.md present", "pass" if (d / "HANDOFF.md").is_file() else "warn", "" if (d / "HANDOFF.md").is_file() else "run: handoff runbook")
+    blockers = sum(c["status"] == "fail" for c in checks)
+    return {"dir": str(d), "ready": blockers == 0, "blockers": blockers, "checks": checks}
+
+
+def cmd_env(d: Path):
+    src = d / ".env"
+    if not src.is_file():
+        raise SystemExit(f"handoff: no .env in {d}")
+    lines = env_keys_with_comments(src)
+    dest = d / ".env.example"
+    if dest.exists():
+        existing = parse_env(dest)
+        new_keys = [l.split("=", 1)[0] for l in lines if "=" in l and not l.lstrip().startswith("#") and l.split("=", 1)[0] not in existing]
+        if new_keys:
+            with dest.open("a") as fh:
+                fh.write("\n# added by handoff " + dt.date.today().isoformat() + "\n")
+                fh.write("\n".join(f"{k}=" for k in new_keys) + "\n")
+        return {"file": str(dest), "added": new_keys, "created": False}
+    dest.write_text("# Copy to .env and fill in values. Generated by handoff.\n" + "\n".join(lines) + "\n")
+    keys = [l.split("=", 1)[0] for l in lines if "=" in l and not l.lstrip().startswith("#")]
+    return {"file": str(dest), "added": keys, "created": True}
+
+
+def cmd_runbook(d: Path, client: str | None):
+    title, desc = readme_title(d)
+    stack = detect_stack(d)
+    env = parse_env(d / ".env.example") or parse_env(d / ".env")
+    head = (git(d, "rev-parse", "--short", "HEAD") or "").strip()
+    tag = (git(d, "describe", "--tags", "--always") or "").strip()
+    L = [f"# {title}: handoff runbook", ""]
+    if client:
+        L.append(f"Prepared for **{client}** on {dt.date.today().isoformat()}" + (f", version `{tag or head}`." if head else "."))
+        L.append("")
+    if desc:
+        L += [desc, ""]
+    L += ["## 1. Install", "", "```sh"]
+    L += stack["install"] or ["# no install steps detected; add them here"]
+    L += ["```", "", "## 2. Configure", ""]
+    if env:
+        L += ["Copy the template and fill in each value:", "", "```sh", "cp .env.example .env", "```", "",
+              "| Variable | Secret | Value provided by |", "| --- | --- | --- |"]
+        for k in env:
+            L.append(f"| `{k}` | {'yes' if SECRET_KEY.search(k) else 'no'} | |")
+    else:
+        L.append("No environment variables required.")
+    L += ["", "## 3. Run", "", "```sh"]
+    L += stack["run"] or ["# no run command detected; add it here"]
+    L += ["```", ""]
+    if stack["test"]:
+        L += ["## 4. Verify", "", "```sh", *stack["test"], "```", ""]
+    L += ["## 5. Updates", "",
+          "New versions are delivered as a package with a `SHA256SUMS` file. To apply one:", "", "```sh",
+          "sha256sum -c SHA256SUMS            # confirm the package is intact",
+          "handoff sync ./new-version ./app   # preview changes (dry run)",
+          "handoff sync ./new-version ./app --apply",
+          "```", "", "## 6. Secrets checklist", ""]
+    secrets = [k for k in env if SECRET_KEY.search(k)]
+    if secrets:
+        L += [f"- [ ] `{k}`: issued under the client's own account, stored outside the repo, rotated after handoff" for k in secrets]
+    else:
+        L.append("- [ ] Confirm no credentials are shared from the developer's accounts")
+    L += ["- [ ] Developer access to client systems removed or downgraded after acceptance",
+          "- [ ] Domain, hosting and third-party accounts are owned by the client", ""]
+    for n in stack["notes"]:
+        L.append(f"> {n}")
+    (d / "HANDOFF.md").write_text("\n".join(L) + "\n")
+    return {"file": str(d / "HANDOFF.md"), "stack": stack, "env_keys": list(env)}
+
+
+def excluded(rel: str, patterns):
+    parts = rel.split("/")
+    hit = False
+    for p in patterns:
+        neg = p.startswith("!")
+        pat = p[1:] if neg else p
+        if any(fnmatch.fnmatch(part, pat) for part in parts) or fnmatch.fnmatch(rel, pat):
+            hit = not neg
+    return hit
+
+
+def walk(root: Path, patterns):
+    files = {}
+    for base, dirs, names in os.walk(root):
+        rb = os.path.relpath(base, root)
+        rb = "" if rb == "." else rb + "/"
+        dirs[:] = [x for x in dirs if not excluded(rb + x, patterns)]
+        for n in names:
+            rel = rb + n
+            if not excluded(rel, patterns):
+                files[rel] = Path(base) / n
+    return files
+
+
+def same(a: Path, b: Path):
+    sa, sb = a.stat(), b.stat()
+    if sa.st_size != sb.st_size:
+        return False
+    if int(sa.st_mtime) == int(sb.st_mtime):
+        return True
+    return hashlib.sha256(a.read_bytes()).digest() == hashlib.sha256(b.read_bytes()).digest()
+
+
+def cmd_sync(src: Path, dst: Path, apply: bool, extra_excludes, keep_extra: bool):
+    if not src.is_dir():
+        raise SystemExit(f"handoff: source not found: {src}")
+    patterns = DEFAULT_EXCLUDES + list(extra_excludes or [])
+    s = walk(src, patterns)
+    d = walk(dst, patterns) if dst.is_dir() else {}
+    plan = {"add": sorted(k for k in s if k not in d),
+            "update": sorted(k for k in s if k in d and not same(s[k], d[k])),
+            "delete": [] if keep_extra else sorted(k for k in d if k not in s)}
+    if apply:
+        dst.mkdir(parents=True, exist_ok=True)
+        for rel in plan["add"] + plan["update"]:
+            target = dst / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(s[rel], target)
+        for rel in plan["delete"]:
+            (dst / rel).unlink()
+        for base, dirs, names in os.walk(dst, topdown=False):
+            p = Path(base)
+            rel = os.path.relpath(p, dst)
+            if p != dst and not any(p.iterdir()) and not excluded(rel, patterns):
+                p.rmdir()
+    return {"src": str(src), "dst": str(dst), "applied": apply, **plan,
+            "protected": "excluded from sync: " + ", ".join(patterns)}
+
+
+def cmd_package(d: Path, client: str | None, out: Path | None):
+    title, _ = readme_title(d)
+    name = re.sub(r"[^A-Za-z0-9._-]+", "-", d.name)
+    version = (git(d, "describe", "--tags", "--always", "--dirty") or "").strip() or dt.date.today().strftime("%Y%m%d")
+    out = out or (d.parent / "handoff-dist")
+    out.mkdir(parents=True, exist_ok=True)
+    if (d / ".env").is_file() and not (d / ".env.example").is_file():
+        cmd_env(d)
+    if not (d / "HANDOFF.md").is_file():
+        cmd_runbook(d, client)
+    tracked = git(d, "ls-files", "-z")
+    if tracked is not None:
+        files = [f for f in tracked.split("\0") if f and not excluded(f, DEFAULT_EXCLUDES)]
+        for extra in ("HANDOFF.md", ".env.example"):
+            if (d / extra).is_file() and extra not in files:
+                files.append(extra)
+    else:
+        files = list(walk(d, DEFAULT_EXCLUDES))
+    files = sorted(set(f for f in files if (d / f).is_file()))
+    sums = []
+    for f in files:
+        sums.append(f"{hashlib.sha256((d / f).read_bytes()).hexdigest()}  {f}")
+    sums_text = "\n".join(sums) + "\n"
+    prefix = f"{name}-{version}"
+    archive = out / f"{prefix}.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        for f in files:
+            tar.add(d / f, arcname=f"{prefix}/{f}")
+        info = tarfile.TarInfo(f"{prefix}/SHA256SUMS")
+        data = sums_text.encode()
+        info.size = len(data)
+        info.mtime = int(dt.datetime.now().timestamp())
+        tar.addfile(info, io.BytesIO(data))
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    (out / f"{prefix}.tar.gz.sha256").write_text(f"{digest}  {archive.name}\n")
+    return {"archive": str(archive), "sha256": digest, "files": len(files), "version": version,
+            "title": title, "client": client, "checksum_file": str(out / f"{prefix}.tar.gz.sha256")}
+
+
+def human(cmd, res):
+    if cmd == "check":
+        icon = {"pass": "ok  ", "warn": "warn", "fail": "FAIL"}
+        for c in res["checks"]:
+            print(f"  {icon[c['status']]}  {c['check']}" + (f"  ({c['detail']})" if c["detail"] else ""))
+        print("Ready to hand off." if res["ready"] else f"{res['blockers']} blocker(s) to fix before handoff.")
+    elif cmd == "env":
+        print(("Created " if res["created"] else "Updated ") + res["file"] + (f" with {len(res['added'])} key(s)" if res["added"] else " (no new keys)"))
+    elif cmd == "runbook":
+        print(f"Wrote {res['file']}")
+    elif cmd == "sync":
+        mode = "Applied" if res["applied"] else "Dry run (add --apply to perform)"
+        print(f"{mode}: {res['src']} -> {res['dst']}")
+        for k, sym in (("add", "+"), ("update", "~"), ("delete", "-")):
+            for f in res[k]:
+                print(f"  {sym} {f}")
+        print(f"  {len(res['add'])} to add, {len(res['update'])} to update, {len(res['delete'])} to delete")
+    elif cmd == "package":
+        print(f"Packaged {res['files']} files -> {res['archive']}")
+        print(f"  sha256 {res['sha256']}")
+
+
+def main(argv):
+    cap_mode = bool(argv) and argv[0] in CAPABILITIES
+    stdin_meta = {}
+    if cap_mode:
+        argv = CAPABILITIES[argv[0]] + argv[1:]
+        if not sys.stdin.isatty():
+            try:
+                stdin_meta = json.loads(sys.stdin.read() or "{}")
+                if not isinstance(stdin_meta, dict):
+                    stdin_meta = {}
+            except ValueError:
+                stdin_meta = {}
+    ap = argparse.ArgumentParser(prog="handoff", description=__doc__.split("\n")[0])
+    ap.add_argument("--version", action="version", version=VERSION)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for name in ("check", "env", "runbook", "package"):
+        sp = sub.add_parser(name)
+        sp.add_argument("dir", nargs="?", default=".")
+        sp.add_argument("--json", action="store_true")
+        if name in ("runbook", "package"):
+            sp.add_argument("--client")
+        if name == "package":
+            sp.add_argument("--out")
+    sp = sub.add_parser("sync")
+    sp.add_argument("src")
+    sp.add_argument("dst")
+    sp.add_argument("--apply", action="store_true")
+    sp.add_argument("--exclude", action="append", default=[])
+    sp.add_argument("--keep-extra", action="store_true", help="never delete files that exist only in DST")
+    sp.add_argument("--json", action="store_true")
+    a = ap.parse_args(argv)
+
+    if a.cmd == "sync":
+        res = cmd_sync(Path(a.src).expanduser().resolve(), Path(a.dst).expanduser().resolve(), a.apply, a.exclude, a.keep_extra)
+    else:
+        d = Path(stdin_meta.get("dir") or a.dir).expanduser().resolve()
+        if a.cmd == "check":
+            res = cmd_check(d)
+        elif a.cmd == "env":
+            res = cmd_env(d)
+        elif a.cmd == "runbook":
+            res = cmd_runbook(d, a.client or stdin_meta.get("client"))
+        else:
+            res = cmd_package(d, a.client or stdin_meta.get("client"), Path(a.out).expanduser().resolve() if a.out else None)
+    if a.json or not sys.stdout.isatty():
+        print(json.dumps(res, indent=2))
+    else:
+        human(a.cmd, res)
+    if a.cmd == "check" and not res["ready"]:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

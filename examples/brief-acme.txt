@@ -1,0 +1,20 @@
+Subject: Help with our booking system
+
+Hi Sara,
+
+We run three yoga studios and our current booking process is a mess of spreadsheets and emails.
+Here's what we're looking for:
+
+- Customers can sign up and log in to book classes online
+- Take payments and class-pack subscriptions with Stripe
+- Send email reminders 24 hours before each class
+- An admin dashboard showing bookings and revenue per studio
+- Import our existing customer list from Google Sheets (about 2,000 rows)
+- Simple, responsive design that works on phones
+- Sync bookings with our Mindbody account, maybe, if it's not too complex
+
+We'd like to launch by March 15, 2027. Our budget is around $12,000 but we're flexible.
+Hosting and deployment should be handled for us, and we'd love a short training guide for staff.
+
+Thanks,
+Priya - Acme Yoga

@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+"""logbook - time tracking from your shell activity and git commits, exported for invoicing.
+
+Usage:
+  logbook hook                                   print the zsh hook (add to ~/.zshrc: eval "$(logbook hook)")
+  logbook report [--since 7d] [--until DATE] [--project NAME] [--rate 95] [--idle 15] [--git] [--json]
+  logbook csv    [same filters] [--out FILE]     invoice-ready CSV: date,project,hours,rate,amount
+  logbook map PATH NAME                          map a directory (and below) to a project name
+  logbook projects                               list known projects
+  logbook add NAME HOURS [--date YYYY-MM-DD] [--note TEXT]   manual entry (meetings, calls)
+
+Each shell command logs one line: epoch, directory, active rw tool. Commands within --idle minutes of
+each other are one working session; each session also gets a 5-minute tail for the last command.
+Project = active rw tool, else the longest `logbook map` prefix, else the git repo name.
+Data dir: $LOGBOOK_DIR (default ~/.local/share/logbook). Hub capability: time.report
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import datetime as dt
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+VERSION = "0.1.0"
+CAPABILITIES = {"time.report": ["report", "--json"]}
+DATA = Path(os.environ.get("LOGBOOK_DIR", Path.home() / ".local/share/logbook")).expanduser()
+EVENTS = DATA / "events.tsv"
+MAPS = DATA / "projects.tsv"
+MANUAL = DATA / "manual.tsv"
+TAIL_MIN = 5
+
+HOOK = r'''# logbook: record one line per command (epoch, directory, active rw tool)
+zmodload zsh/datetime 2>/dev/null
+typeset -g LOGBOOK_FILE="${LOGBOOK_DIR:-$HOME/.local/share/logbook}/events.tsv"
+[[ -d ${LOGBOOK_FILE:h} ]] || mkdir -p ${LOGBOOK_FILE:h}
+_logbook_preexec() { print -r -- "${EPOCHSECONDS}"$'\t'"${PWD}"$'\t'"${RW_ACTIVE:-}" >>| $LOGBOOK_FILE 2>/dev/null }
+autoload -Uz add-zsh-hook
+add-zsh-hook preexec _logbook_preexec
+'''
+
+
+def log(msg):
+    print(f"logbook: {msg}", file=sys.stderr)
+
+
+def parse_when(s: str | None, default: dt.datetime):
+    if not s:
+        return default
+    m = re.fullmatch(r"(\d+)([hdw])", s)
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+        delta = {"h": dt.timedelta(hours=n), "d": dt.timedelta(days=n), "w": dt.timedelta(weeks=n)}[unit]
+        base = dt.datetime.now()
+        if unit in "dw":
+            base = base.replace(hour=0, minute=0, second=0, microsecond=0) + dt.timedelta(days=1)
+        return base - delta
+    if s == "today":
+        return dt.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    if s == "monday":
+        t = dt.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        return t - dt.timedelta(days=t.weekday())
+    return dt.datetime.fromisoformat(s)
+
+
+def load_maps():
+    maps = []
+    if MAPS.is_file():
+        for line in MAPS.read_text().splitlines():
+            if "\t" in line:
+                p, n = line.split("\t", 1)
+                maps.append((p.rstrip("/"), n))
+    return sorted(maps, key=lambda x: -len(x[0]))
+
+
+_git_cache: dict[str, str | None] = {}
+
+
+def git_root(path: str):
+    if path in _git_cache:
+        return _git_cache[path]
+    root = None
+    p = Path(path)
+    while True:
+        if (p / ".git").exists():
+            root = str(p)
+            break
+        if p.parent == p:
+            break
+        p = p.parent
+    _git_cache[path] = root
+    return root
+
+
+def project_for(pwd: str, tool: str, maps):
+    if tool:
+        return tool
+    for prefix, name in maps:
+        if pwd == prefix or pwd.startswith(prefix + "/"):
+            return name
+    root = git_root(pwd)
+    if root:
+        return Path(root).name
+    return None
+
+
+def load_events(start: dt.datetime, end: dt.datetime, maps, include_other: bool):
+    per = defaultdict(list)
+    if not EVENTS.is_file():
+        return per
+    s, e = start.timestamp(), end.timestamp()
+    with EVENTS.open(errors="replace") as fh:
+        for line in fh:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 2 or not parts[0].isdigit():
+                continue
+            ts = int(parts[0])
+            if ts < s or ts >= e:
+                continue
+            proj = project_for(parts[1], parts[2] if len(parts) > 2 else "", maps)
+            if proj is None:
+                if not include_other:
+                    continue
+                proj = "other"
+            per[proj].append(ts)
+    return per
+
+
+def git_events(start, end, maps, per):
+    """Add your own commit timestamps from mapped project dirs and repos seen in the event log."""
+    roots = {p: n for p, n in maps if (Path(p) / ".git").exists()}
+    for path in list(_git_cache):
+        r = _git_cache[path]
+        if r and r not in roots:
+            roots[r] = project_for(r, "", maps) or Path(r).name
+    for root, name in roots.items():
+        try:
+            email = subprocess.run(["git", "-C", root, "config", "user.email"], capture_output=True, text=True).stdout.strip()
+            args = ["git", "-C", root, "log", "--all", f"--since={int(start.timestamp())}", f"--until={int(end.timestamp())}", "--format=%at"]
+            if email:
+                args.append(f"--author={email}")
+            out = subprocess.run(args, capture_output=True, text=True, timeout=60).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        per[name].extend(int(x) for x in out.split() if x.isdigit())
+
+
+def sessions(stamps, idle_min):
+    stamps = sorted(set(stamps))
+    out = []
+    if not stamps:
+        return out
+    gap = idle_min * 60
+    s0 = prev = stamps[0]
+    for t in stamps[1:]:
+        if t - prev > gap:
+            out.append((s0, prev + TAIL_MIN * 60))
+            s0 = t
+        prev = t
+    out.append((s0, prev + TAIL_MIN * 60))
+    return out
+
+
+def load_manual(start, end):
+    rows = []
+    if MANUAL.is_file():
+        for line in MANUAL.read_text().splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 3:
+                d = dt.date.fromisoformat(parts[0])
+                if start.date() <= d <= end.date():
+                    rows.append({"date": parts[0], "project": parts[1], "hours": float(parts[2]),
+                                 "note": parts[3] if len(parts) > 3 else ""})
+    return rows
+
+
+def report(a):
+    end = parse_when(a.until, dt.datetime.now() + dt.timedelta(minutes=1))
+    start = parse_when(a.since, end - dt.timedelta(days=7))
+    maps = load_maps()
+    per = load_events(start, end, maps, a.include_other)
+    if a.git:
+        git_events(start, end, maps, per)
+    by_day = defaultdict(lambda: defaultdict(float))
+    session_count = defaultdict(int)
+    for proj, stamps in per.items():
+        if a.project and proj != a.project:
+            continue
+        for s, e in sessions(stamps, a.idle):
+            session_count[proj] += 1
+            # split sessions that cross midnight
+            cur = dt.datetime.fromtimestamp(s)
+            stop = dt.datetime.fromtimestamp(e)
+            while cur < stop:
+                nxt = min(stop, (cur + dt.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0))
+                by_day[cur.date().isoformat()][proj] += (nxt - cur).total_seconds() / 3600
+                cur = nxt
+    for m in load_manual(start, end):
+        if a.project and m["project"] != a.project:
+            continue
+        by_day[m["date"]][m["project"]] += m["hours"]
+    rows = []
+    for day in sorted(by_day):
+        for proj, h in sorted(by_day[day].items()):
+            step = a.round / 60  # bill in increments of --round minutes, rounded up
+            hours = round(math.ceil(h / step - 1e-9) * step, 2)
+            if hours > 0:
+                rows.append({"date": day, "project": proj, "hours": hours,
+                             "rate": a.rate, "amount": round(hours * a.rate, 2) if a.rate else None})
+    totals = defaultdict(float)
+    for r in rows:
+        totals[r["project"]] += r["hours"]
+    return {
+        "tool": "logbook", "version": VERSION,
+        "since": start.isoformat(timespec="minutes"), "until": end.isoformat(timespec="minutes"),
+        "idle_minutes": a.idle, "rate": a.rate,
+        "projects": [{"project": p, "hours": h, "sessions": session_count.get(p, 0),
+                      "amount": round(h * a.rate, 2) if a.rate else None} for p, h in sorted(totals.items(), key=lambda x: -x[1])],
+        "total_hours": sum(totals.values()),
+        "total_amount": round(sum(totals.values()) * a.rate, 2) if a.rate else None,
+        "days": rows,
+    }
+
+
+def main(argv):
+    cap_mode = bool(argv) and argv[0] in CAPABILITIES
+    if cap_mode:
+        argv = CAPABILITIES[argv[0]] + argv[1:]
+    ap = argparse.ArgumentParser(prog="logbook", description=__doc__.split("\n")[0])
+    ap.add_argument("--version", action="version", version=VERSION)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("hook")
+    for name in ("report", "csv"):
+        sp = sub.add_parser(name)
+        sp.add_argument("--since", help="7d, 2w, 12h, today, monday, or YYYY-MM-DD (default 7d)")
+        sp.add_argument("--until", help="YYYY-MM-DD (exclusive) or relative")
+        sp.add_argument("--project")
+        sp.add_argument("--rate", type=float, default=float(os.environ.get("LOGBOOK_RATE", 0)) or None)
+        sp.add_argument("--idle", type=int, default=int(os.environ.get("LOGBOOK_IDLE", 15)), help="minutes")
+        sp.add_argument("--round", type=int, default=int(os.environ.get("LOGBOOK_ROUND", 6)), help="billing increment in minutes, rounded up (default 6 = 0.1 h)")
+        sp.add_argument("--git", action="store_true", help="also count your git commit times")
+        sp.add_argument("--include-other", action="store_true", help="count time outside any project as 'other'")
+        sp.add_argument("--json", action="store_true")
+        if name == "csv":
+            sp.add_argument("--out")
+    sp = sub.add_parser("map")
+    sp.add_argument("path")
+    sp.add_argument("name")
+    sub.add_parser("projects")
+    sp = sub.add_parser("add")
+    sp.add_argument("name")
+    sp.add_argument("hours", type=float)
+    sp.add_argument("--date", default=dt.date.today().isoformat())
+    sp.add_argument("--note", default="")
+    a = ap.parse_args(argv)
+    DATA.mkdir(parents=True, exist_ok=True)
+
+    if a.cmd == "hook":
+        print(HOOK, end="")
+        return 0
+    if a.cmd == "map":
+        path = str(Path(a.path).expanduser().resolve())
+        maps = [(p, n) for p, n in load_maps() if p != path] + [(path, a.name)]
+        MAPS.write_text("".join(f"{p}\t{n}\n" for p, n in maps))
+        print(f"mapped {path} -> {a.name}")
+        return 0
+    if a.cmd == "add":
+        with MANUAL.open("a") as fh:
+            fh.write(f"{a.date}\t{a.name}\t{a.hours}\t{a.note.replace(chr(9), ' ')}\n")
+        print(f"added {a.hours} h to {a.name} on {a.date}")
+        return 0
+    if a.cmd == "projects":
+        for p, n in load_maps():
+            print(f"{n:<20} {p}")
+        return 0
+
+    a.rate = a.rate or None
+    res = report(a)
+    if a.cmd == "csv":
+        fh = open(a.out, "w", newline="") if a.out else sys.stdout
+        w = csv.writer(fh)
+        w.writerow(["date", "project", "hours", "rate", "amount"])
+        for r in res["days"]:
+            w.writerow([r["date"], r["project"], f"{r['hours']:.2f}", r["rate"] or "", f"{r['amount']:.2f}" if r["amount"] is not None else ""])
+        w.writerow(["TOTAL", "", f"{res['total_hours']:.2f}", "", f"{res['total_amount']:.2f}" if res["total_amount"] is not None else ""])
+        if a.out:
+            fh.close()
+            log(f"wrote {a.out}")
+        return 0
+    if a.json or not sys.stdout.isatty():
+        print(json.dumps(res, indent=2))
+    else:
+        print(f"{res['since'][:10]} to {res['until'][:10]}  (idle gap {a.idle} min)")
+        if not res["projects"]:
+            print("  no tracked time; is the hook installed?  eval \"$(logbook hook)\"")
+        for p in res["projects"]:
+            amt = f"  {p['amount']:>10,.2f}" if p["amount"] is not None else ""
+            print(f"  {p['project']:<24} {p['hours']:>6.2f} h  {p['sessions']:>3} sessions{amt}")
+        if res["projects"]:
+            amt = f"  {res['total_amount']:>10,.2f}" if res["total_amount"] is not None else ""
+            print(f"  {'TOTAL':<24} {res['total_hours']:>6.2f} h{' ' * 14}{amt}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

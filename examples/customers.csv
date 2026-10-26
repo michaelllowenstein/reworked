@@ -1,0 +1,8 @@
+ id ,name,email,signup_date,plan,price,studio
+1, Priya Shah ,priya@acmeyoga.com,2024-01-05,monthly,$89.00,Downtown
+2,Tom Reed,tom.reed@example,05/02/2024,class-pack,$120,Downtown
+3,Ana Lima,ana@lima.io,2024/03/11,monthly,89,Westside
+3,Ana Lima,ana@lima.io,2024/03/11,monthly,89,Westside
+4,Ben Ochoa,,2024-04-20,trial,0,Westside
+5,Chloe Wu,chloe@wu.dev,Apr 28 2024,annual,"$899.00",Northgate
+6, Dev Patel,dev@patel.ca,2024-05-02,monthly,$89.00, Northgate
